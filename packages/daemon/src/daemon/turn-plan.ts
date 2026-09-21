@@ -55,6 +55,8 @@ export interface TurnPlan {
   readonly isDm: boolean
   readonly channel: string
   readonly thread?: string
+  /** Logical session/transcript coordinate; provider rendering keeps using thread/statusThread. */
+  readonly sessionThread: string
   readonly statusThread: string
   readonly transcriptChannel: string
   readonly integrationId?: string
@@ -134,7 +136,8 @@ export function buildTurnPlan(input: TurnPlanInput): TurnPlan {
     isDm: msg.isDm,
     channel: msg.channel,
     ...(msg.thread !== undefined ? { thread: msg.thread } : {}),
-    statusThread: msg.thread ?? msg.msgId,
+    sessionThread: entry.coordinates.sessionThread,
+    statusThread: entry.coordinates.deliveryThread,
     transcriptChannel: transcriptChannelKey(msg.channel, msg.transportScope),
     ...(integrationId !== undefined ? { integrationId } : {}),
     requesterId: msg.sender.id,

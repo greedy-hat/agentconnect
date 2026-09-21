@@ -7,6 +7,7 @@ import { TurnOutputRegistry, type TurnOutputSurface } from '../src/platforms/tur
 import type { NormalizedMessage } from '../src/messages/normalized.js'
 import type { CallMeta, DaemonConverger, DaemonRenderAction, Pending, QueueEntry } from '../src/daemon/turn-types.js'
 import type { WebchatTurnContext } from '../src/webchat/types.js'
+import { currentSessionCoordinates } from '../src/session/session-coordinate.js'
 
 /**
  * The PURE half of one dispatched turn: every decision `dispatchOne` makes before
@@ -45,8 +46,16 @@ const message = (over: Partial<NormalizedMessage> = {}): NormalizedMessage =>
 const webchatCtx = (over: Partial<WebchatTurnContext> = {}): WebchatTurnContext =>
   ({ conversationId: 'c1', turnId: 'wt1', sink: { done: () => {} }, ...over }) as unknown as WebchatTurnContext
 
-const entryFor = (over: Partial<QueueEntry> = {}): QueueEntry =>
-  ({ agentId: 'a1', msg: message(), initAbort: new AbortController(), ...over }) as unknown as QueueEntry
+const entryFor = (over: Partial<QueueEntry> = {}): QueueEntry => {
+  const msg = over.msg ?? message()
+  return {
+    agentId: 'a1',
+    msg,
+    coordinates: currentSessionCoordinates(msg),
+    initAbort: new AbortController(),
+    ...over
+  } as unknown as QueueEntry
+}
 
 const agentFor = (over: Partial<TurnPlanInput['agent']> = {}): TurnPlanInput['agent'] => ({
   name: 'ada',
@@ -70,6 +79,17 @@ const planFor = (over: Partial<TurnPlanInput> = {}) =>
   })
 
 describe('buildTurnPlan', () => {
+  it('keeps logical session identity separate from physical reply/status destinations', () => {
+    const plan = planFor({
+      entry: entryFor({
+        msg: message({ thread: 'physical-thread' }),
+        coordinates: { deliveryThread: 'physical-thread', sessionThread: 'logical-session' }
+      })
+    })
+    expect(plan.sessionThread).toBe('logical-session')
+    expect(plan.thread).toBe('physical-thread')
+    expect(plan.statusThread).toBe('physical-thread')
+  })
   it('lets a sticky output override win over the agent default, and falls back without one', () => {
     expect(planFor({ stickyOutputMode: 'high' }).mode).toBe('high')
     expect(planFor().mode).toBe('low')

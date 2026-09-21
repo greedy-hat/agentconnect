@@ -143,6 +143,11 @@ import {
   slackTsForWallClock,
   quotedSourceBlock
 } from './session/session-manager.js'
+import {
+  currentSessionCoordinates,
+  sessionKeyForCoordinates,
+  type SessionCoordinates
+} from './session/session-coordinate.js'
 import { clampRuntimeTitle, isPromptEchoTitle, promptEchoPrefix } from './session/derive-title.js'
 import {
   ThreadContextCoordinator,
@@ -9274,9 +9279,10 @@ export class Daemon {
   private async recordObservedInbound(
     msg: NormalizedMessage,
     recipient?: string,
-    includeAttachment = true
+    includeAttachment = true,
+    coordinates: Pick<SessionCoordinates, 'sessionThread'> = currentSessionCoordinates(msg)
   ): Promise<void> {
-    const { thread, ts } = transcriptCoords(msg)
+    const { thread, ts } = transcriptCoords(msg, coordinates)
     const transcriptChannel = transcriptChannelKey(msg.channel, msg.transportScope)
     // Active = a session touched within the idle window OR a turn in flight right
     // now. The in-flight check is load-bearing: session.updatedAt is stamped at
@@ -9287,10 +9293,10 @@ export class Daemon {
     const recentlyActive =
       (await this.store.activeSessionCountSince(msg.channel, thread, sinceTs, msg.transportScope)) > 0
     const inFlightAgent = [...this.pending.values()].find(
-      (p) => p.plan.transcriptChannel === transcriptChannel && p.plan.statusThread === thread
+      (p) => p.plan.transcriptChannel === transcriptChannel && p.plan.sessionThread === thread
     )?.plan.agentId
     const initializingAgent = [...this.activeGateEntries.values()].find((entry) => {
-      const coords = transcriptCoords(entry.msg)
+      const coords = transcriptCoords(entry.msg, entry.coordinates)
       return (
         transcriptChannelKey(entry.msg.channel, entry.msg.transportScope) === transcriptChannel &&
         coords.thread === thread
@@ -9435,7 +9441,7 @@ export class Daemon {
         completeness: readState.truncated ? 'observed-only' : 'authoritative',
         events: history.map((event) => ({
           channel: pending.plan.transcriptChannel,
-          thread: pending.plan.statusThread,
+          thread: pending.plan.sessionThread,
           ts: event.ts,
           sender: event.sender,
           kind: 'text' as const,
@@ -9457,7 +9463,7 @@ export class Daemon {
     const refresh = await this.threadContext.refresh({
       agentId: pending.plan.agentId,
       transcriptChannel: pending.plan.transcriptChannel,
-      thread: pending.plan.statusThread,
+      thread: pending.plan.sessionThread,
       afterRevision,
       // Pairwise a2a threads are shared storage but private conversations:
       // scope the refresh to this agent's own rows (#967).
@@ -9487,13 +9493,13 @@ export class Daemon {
         // turn — a sibling's private delivery is not its context (#967).
         await this.store.transcriptSinceRevisionForAgent(
           pending.plan.transcriptChannel,
-          pending.plan.statusThread,
+          pending.plan.sessionThread,
           afterRevision,
           pending.plan.agentId
         )
       : await this.store.transcriptSinceRevision(
           pending.plan.transcriptChannel,
-          pending.plan.statusThread,
+          pending.plan.sessionThread,
           afterRevision,
           pending.plan.agentId
         )
@@ -9503,7 +9509,9 @@ export class Daemon {
   }
 
   private queuedEntriesMatchingContext(key: string, eventTs: ReadonlyMap<string, string | undefined>): QueueEntry[] {
-    return (this.serialQueue.get(key) ?? []).filter((entry) => eventTs.has(transcriptCoords(entry.msg).ts))
+    return (this.serialQueue.get(key) ?? []).filter((entry) =>
+      eventTs.has(transcriptCoords(entry.msg, entry.coordinates).ts)
+    )
   }
 
   private observedQuoteBlock(event: TranscriptEntry, replayed: readonly TranscriptEntry[]): string | undefined {
@@ -9514,7 +9522,7 @@ export class Daemon {
   /** An activation whose row a fence already folded into a prompt for this session: settle it
    *  as coalesced instead of queueing it. Returns false when nothing absorbed this message. */
   private async coalesceLateAdmission(key: string, entry: QueueEntry): Promise<boolean> {
-    if (!this.claimAbsorbedContext(key, transcriptCoords(entry.msg).ts)) return false
+    if (!this.claimAbsorbedContext(key, transcriptCoords(entry.msg, entry.coordinates).ts)) return false
     const sessionId = [...this.pending.values()].find((p) => p.plan.sessionKey === key)?.acpSessionId
     await this.coalesceEntryIntoTurn(entry, sessionId ?? null)
     defaultTurnOutputMetrics.queueCoalesced(entry.msg.platform, 1)
@@ -9538,7 +9546,7 @@ export class Daemon {
         stopReason: reason
       })
     }
-    const { thread, ts } = transcriptCoords(entry.msg)
+    const { thread, ts } = transcriptCoords(entry.msg, entry.coordinates)
     const mention = attachmentMention(entry.msg.attachments)
     await this.store.appendTranscript({
       channel: transcriptChannelKey(entry.msg.channel, entry.msg.transportScope),
@@ -9595,7 +9603,7 @@ export class Daemon {
     }
     // The live prompt now carries this row: remember it as absorbed AND already settled, so the
     // final fence does not regenerate for it and a late admission cannot coalesce it twice.
-    const { ts } = transcriptCoords(entry.msg)
+    const { ts } = transcriptCoords(entry.msg, entry.coordinates)
     this.noteAbsorbedContext(key, new Map([[ts, steeredTranscriptText(entry.msg)]]))
     this.claimAbsorbedContext(key, ts)
     await this.coalesceEntryIntoTurn(entry, target.acpSessionId, 'steered_into_turn')
@@ -9620,7 +9628,7 @@ export class Daemon {
     const kept: QueueEntry[] = []
     let count = 0
     for (const entry of queue) {
-      if (!eventTs.has(transcriptCoords(entry.msg).ts)) {
+      if (!eventTs.has(transcriptCoords(entry.msg, entry.coordinates).ts)) {
         kept.push(entry)
         continue
       }
@@ -10936,6 +10944,9 @@ export class Daemon {
     if (integrationId !== undefined) {
       msg.transportScope ??= this.transportScopeForIntegrationIds([integrationId])
     }
+    // Resolve target-specific coordinates exactly once, before observation and admission.
+    // The QueueEntry carries this trusted decision through every later seam.
+    const coordinates = currentSessionCoordinates(msg)
     // An agent-initiated wake's INBOUND message posts live too (#807 only posted the woken
     // REPLY, so the sender's message appeared on refresh but never in the live view). Mint
     // its canonical post identity before the inbox row persists so a replay reuses it and
@@ -10950,13 +10961,13 @@ export class Daemon {
       this.cfg.features.turnFinalContextRefresh &&
       originKindOf(msg.platform) === 'chat'
     ) {
-      await this.recordObservedInbound(msg, agentId)
+      await this.recordObservedInbound(msg, agentId, true, coordinates)
     }
     // Not an async executor: a rejection from any awaited admission/store step must settle
     // THIS promise, not vanish as an unhandled rejection while the caller waits forever.
     return new Promise<string | null>((resolve, reject) => {
       void (async () => {
-        const key = sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
+        const key = sessionKeyForCoordinates(agentId, msg, coordinates)
         const reviewLane = reviewSubjectLane(hookContext, hookCoordinates(agentId, msg, integrationId))
         const safetyDrainByKey = this.safetyDrainAdmissionKeys.get(agentId)?.has(key) === true
         let admissionSettled = false
@@ -10990,10 +11001,7 @@ export class Daemon {
           const activationKey = callMeta?.activationKey
           if (activationKey !== undefined) {
             if (result.accepted) {
-              await this.store.admitActivation(
-                activationKey,
-                sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
-              )
+              await this.store.admitActivation(activationKey, key)
             } else {
               // Never admitted ⇒ give the claim back, so a retry is a first attempt rather
               // than being deduplicated against a child that was never opened.
@@ -11107,6 +11115,7 @@ export class Daemon {
         const entry: QueueEntry = {
           agentId,
           msg,
+          coordinates,
           initAbort: new AbortController(),
           ...(integrationId !== undefined ? { integrationId } : {}),
           ...(webchat ? { webchat } : {}),
@@ -11675,7 +11684,8 @@ export class Daemon {
           const runAdmittedEntry = entry.admissionWait === undefined || (await entry.admissionWait)
           entry.admissionWait = undefined
           if (runAdmittedEntry) {
-            if (entry.deferObservedInbound) await this.recordObservedInbound(entry.msg, entry.agentId)
+            if (entry.deferObservedInbound)
+              await this.recordObservedInbound(entry.msg, entry.agentId, true, entry.coordinates)
             const releaseDispatch = await this.admitActiveDispatch(entry.agentId, key)
             let sessionId: string | null
             try {
@@ -12166,6 +12176,7 @@ export class Daemon {
         // a standing directive naming the origin as the reply target.
         callMeta?.needsReply,
         {
+          coordinates: entry.coordinates,
           initializeOnly: plan.initializeOnly,
           // CallMeta is the trusted distinction between a real A2A delivery and
           // synthetic `source: agent` wakes (background task/orchestration). A webchat
@@ -12814,7 +12825,7 @@ export class Daemon {
     let finalCaptureInput = handled.captureInput ?? msg.text
     let baseRevision =
       handled.contextRevision ??
-      (await this.store.threadTranscriptRevision(p.plan.transcriptChannel, p.plan.statusThread, p.plan.agentId))
+      (await this.store.threadTranscriptRevision(p.plan.transcriptChannel, p.plan.sessionThread, p.plan.agentId))
     let providerCheckpoint = handled.providerCheckpoint
     if (p.plan.stageAnswer || p.plan.webchatRefresh) {
       // Queue entries remain untouched until every gate above has succeeded.
@@ -12847,7 +12858,7 @@ export class Daemon {
       await this.coalesceQueuedContext(key, sessionId, representedEventTs)
       baseRevision = await this.store.threadTranscriptRevision(
         p.plan.transcriptChannel,
-        p.plan.statusThread,
+        p.plan.sessionThread,
         p.plan.agentId
       )
       providerCheckpoint = initialRefresh.providerCheckpoint ?? providerCheckpoint
@@ -13030,7 +13041,7 @@ export class Daemon {
         .sort((a, b) => a.eventTimeUs - b.eventTimeUs || a.seq - b.seq)
       const finalRevision = await this.store.threadTranscriptRevision(
         p.plan.transcriptChannel,
-        p.plan.statusThread,
+        p.plan.sessionThread,
         p.plan.agentId
       )
 
@@ -13138,7 +13149,7 @@ export class Daemon {
       await this.coalesceQueuedContext(key, sessionId, eventTs)
       baseRevision = await this.store.threadTranscriptRevision(
         p.plan.transcriptChannel,
-        p.plan.statusThread,
+        p.plan.sessionThread,
         p.plan.agentId
       )
       generation += 1
@@ -13231,7 +13242,7 @@ export class Daemon {
         const replyTs = await webchatTurnOutput.appendWebchatTextRow(
           this.store,
           p.plan.transcriptChannel,
-          plan.statusThread,
+          plan.sessionThread,
           monotonicTs(),
           {
             postId: replyPostId,
@@ -13331,7 +13342,7 @@ export class Daemon {
     const { rec, sessionId, handled, memoryCaptureTarget } = turn
     const { stopReason, usage, finalCaptureInput } = turn.outcome
     // …and any trailing reasoning the agent emitted after its last reply.
-    for (const ev of rec.onFinal()) await this.recordEvent(agentId, plan.transcriptChannel, plan.statusThread, ev)
+    for (const ev of rec.onFinal()) await this.recordEvent(agentId, plan.transcriptChannel, plan.sessionThread, ev)
     // The turn is over, so nothing more will supersede a coalesced tool body: make the last
     // state of every streamed tool call durable now rather than on the buffer's own timer.
     await this.store.flushToolCallWrites()
@@ -13493,7 +13504,7 @@ export class Daemon {
         const replyTs = await webchatTurnOutput.appendWebchatTextRow(
           this.store,
           p.plan.transcriptChannel,
-          plan.statusThread,
+          plan.sessionThread,
           monotonicTs(),
           {
             postId: partialPostId,
@@ -13729,7 +13740,7 @@ export class Daemon {
         phase: settlement.finalPhase,
         platform: msg.platform,
         channel: msg.channel,
-        thread: plan.statusThread
+        thread: plan.sessionThread
       })
       p.signals.resolveDone()
     } else if (!settlement.propagatingTurnError) {
@@ -13969,10 +13980,10 @@ export class Daemon {
     if (!anchor) return
     const coords =
       'plan' in anchor
-        ? { channel: anchor.plan.transcriptChannel, thread: anchor.plan.statusThread }
+        ? { channel: anchor.plan.transcriptChannel, thread: anchor.plan.sessionThread }
         : {
             channel: transcriptChannelKey(anchor.msg.channel, anchor.msg.transportScope),
-            thread: transcriptCoords(anchor.msg).thread
+            thread: transcriptCoords(anchor.msg, anchor.coordinates).thread
           }
     const who = actor?.name?.trim() || actor?.userId
     const by = who ? ` by ${who}` : ''
@@ -14126,7 +14137,7 @@ export class Daemon {
   private async recordReplySegment(p: Pending, text: string): Promise<void> {
     await this.store.appendTranscript({
       channel: p.plan.transcriptChannel,
-      thread: p.plan.statusThread,
+      thread: p.plan.sessionThread,
       ts: monotonicTs(),
       sender: p.plan.agentId,
       kind: 'text',
@@ -14359,7 +14370,7 @@ export class Daemon {
     if (!posted.shown) return
     const row: AppRow = {
       channel: p.plan.transcriptChannel,
-      thread: p.plan.statusThread,
+      thread: p.plan.sessionThread,
       ts: monotonicTs(),
       sender: p.plan.agentId,
       appId,
@@ -14442,7 +14453,7 @@ export class Daemon {
       const row: AppRow | undefined = p
         ? {
             channel: p.plan.transcriptChannel,
-            thread: p.plan.statusThread,
+            thread: p.plan.sessionThread,
             // The monotonic internal-event clock, as every other non-conversational row uses: it
             // keeps the card where it was opened and cannot collide with a second card's row.
             ts: monotonicTs(),
@@ -15732,7 +15743,7 @@ export class Daemon {
     }
     // Full activity log (tool/reasoning), recorded regardless of output mode.
     for (const ev of p.rec.onUpdate(update))
-      await this.recordEvent(p.plan.agentId, p.plan.transcriptChannel, p.plan.statusThread, ev)
+      await this.recordEvent(p.plan.agentId, p.plan.transcriptChannel, p.plan.sessionThread, ev)
   }
 
   /** Persist one internal activity event (tool/reasoning/plan). Ordered by row `seq`, so its

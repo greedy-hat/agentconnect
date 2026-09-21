@@ -34,6 +34,7 @@ import type { ReplyGithubReviewThreadsReq, ReplyGithubReviewThreadsResult, Submi
 import type { CodeHostReviewAdapter } from '../codehost/review-adapter.js'
 import { hookCoordinates, openReviewBatch, reviewSubjectLane } from '../codehost/hook-admission.js'
 import { sessionKey, type SessionRecord } from '../store/local-store.js'
+import { currentSessionCoordinates, sessionKeyForCoordinates } from '../session/session-coordinate.js'
 import { formatErr, formatErrWithCauses } from '../daemon/text.js'
 import {
   authorizedReviewTarget,
@@ -290,10 +291,12 @@ export class GithubReviewOrchestrator {
       ...pickCodeHostHookMembers(msg)
     }
     if (cleanup || deleted) {
-      const key = sessionKey(nmsg.platform, nmsg.channel, nmsg.thread ?? nmsg.msgId, msg.agentId, nmsg.transportScope)
+      const coordinates = currentSessionCoordinates(nmsg)
+      const key = sessionKeyForCoordinates(msg.agentId, nmsg, coordinates)
       const entry: QueueEntry = {
         agentId: msg.agentId,
         msg: nmsg,
+        coordinates,
         initAbort: new AbortController(),
         hookContext,
         resolve: () => {},
@@ -381,10 +384,12 @@ export class GithubReviewOrchestrator {
       firedAt: msg.firedAt,
       ...(msg.event ? { event: msg.event } : {})
     }
-    const key = sessionKey(nmsg.platform, nmsg.channel, nmsg.thread ?? nmsg.msgId, msg.agentId, nmsg.transportScope)
+    const coordinates = currentSessionCoordinates(nmsg)
+    const key = sessionKeyForCoordinates(msg.agentId, nmsg, coordinates)
     const entry: QueueEntry = {
       agentId: msg.agentId,
       msg: nmsg,
+      coordinates,
       initAbort: new AbortController(),
       hookContext,
       resolve: () => {},
