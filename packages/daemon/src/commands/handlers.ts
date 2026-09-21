@@ -20,6 +20,7 @@ import type { AgentCommand } from './commands.js'
 import type { Logger } from '../log.js'
 import type { LoadedAgent } from '../agents/load-agents.js'
 import type { NormalizedMessage } from '../messages/normalized.js'
+import type { SessionCoordinates } from '../session/session-coordinate.js'
 import { routeRules, type RouteVia } from '../router/routing-table.js'
 import { conversationAdmitted, integrationRouting, type RoutingRule } from '../router/routing-rule.js'
 import { sessionKey, type LocalStore, type SessionRecord } from '../store/local-store.js'
@@ -50,6 +51,7 @@ import {
 export interface CommandHost {
   log(): Logger
   store(): LocalStore
+  resolveSessionCoordinates(agentId: string, msg: NormalizedMessage, integrationId: string): Promise<SessionCoordinates>
   /** The served agent roster; commands read integrations, admission and chat authority off it. */
   agents(): ReadonlyMap<string, LoadedAgent>
   /** Live turns keyed by (agentId, acpSessionId) — read for the status bar and loop-guard state. */
@@ -521,7 +523,8 @@ export class CommandHandlers {
     // /cancel /status /fast /models /effort /permission /queue all operate on it rather
     // than on a phantom empty thread. `thread`/`key` follow the resolved session so a
     // `/queue` dispatch continues it and the sticky overrides land on the right key.
-    let thread = replyThread
+    const coordinates = await this.host.resolveSessionCoordinates(target.agentId, msg, target.integrationId)
+    let thread = coordinates.sessionThread
     let key = sessionKey(msg.platform, msg.channel, thread, target.agentId, msg.transportScope)
     let rec = await this.host.store().getSession(key)
     // A cold turn owns its logical key before SessionManager persists the session row.
@@ -530,7 +533,7 @@ export class CommandHandlers {
     // actual turn running. Check all gate representations because commands can race the
     // short hand-offs between them.
     let directGateActive = this.gateActiveFor(key)
-    if (!rec && !directGateActive) {
+    if (!rec && !directGateActive && coordinates.sessionThread === coordinates.deliveryThread) {
       const latest = await this.host.store().latestSessionForTransport(target.agentId, msg.channel, msg.transportScope)
       if (latest) {
         rec = latest

@@ -145,6 +145,7 @@ import {
 } from './session/session-manager.js'
 import {
   currentSessionCoordinates,
+  resolveSessionCoordinates,
   sessionKeyForCoordinates,
   type SessionCoordinates
 } from './session/session-coordinate.js'
@@ -268,6 +269,7 @@ import { splitIntoSections } from './slack/formatter.js'
 import {
   integrationConfig,
   integrationCore,
+  integrationSessionMode,
   platformIds,
   platformIntegrationConfig
 } from './platforms/integration-config.js'
@@ -1670,6 +1672,8 @@ export class Daemon {
     return {
       log: () => this.log,
       store: () => this.store,
+      resolveSessionCoordinates: (agentId, msg, integrationId) =>
+        this.sessionCoordinatesFor(agentId, msg, integrationId),
       agents: () => this.agents,
       pending: () => this.pending,
       inflight: () => this.inflight,
@@ -7367,10 +7371,12 @@ export class Daemon {
     const targetMsg = { ...msg }
     if (result.via === 'mention') targetMsg.trigger = 'mention'
     else delete targetMsg.trigger
+    const targetCoordinates = await this.sessionCoordinatesFor(result.agentId, targetMsg, result.integrationId)
     // Observation precedes activation gates and queue admission. A clarification
     // arriving while this logical thread is busy must be visible to the running
     // turn's final refresh even though its own SessionManager.handle() has not begun.
-    if (this.cfg.features.turnFinalContextRefresh) await this.recordObservedInbound(targetMsg, result.agentId)
+    if (this.cfg.features.turnFinalContextRefresh)
+      await this.recordObservedInbound(targetMsg, result.agentId, true, targetCoordinates)
     // Agent-scoped drain (scope:agent): this agent is being reclaimed/rebalanced —
     // drop new turns for it while its in-flight turns finish.
     if (this.drainingAgents.has(result.agentId)) {
@@ -7382,13 +7388,7 @@ export class Daemon {
     // auto / dm) never dispatches — only an explicit @mention does, and it clears the
     // mute. Muted-thread traffic still enters the transcript (recordUnrouted) so the
     // agent catches up on it when re-activated (§8.5).
-    const muteKey = sessionKey(
-      targetMsg.platform,
-      targetMsg.channel,
-      targetMsg.thread ?? targetMsg.msgId,
-      result.agentId,
-      targetMsg.transportScope
-    )
+    const muteKey = sessionKeyForCoordinates(result.agentId, targetMsg, targetCoordinates)
     if (await this.commands.isSessionMuted(muteKey)) {
       if (result.via !== 'mention') {
         await this.recordUnrouted(targetMsg)
@@ -7417,13 +7417,7 @@ export class Daemon {
           admission: Promise.resolve({
             admitted: true,
             agentId: result.agentId,
-            sessionKey: sessionKey(
-              targetMsg.platform,
-              targetMsg.channel,
-              targetMsg.thread ?? targetMsg.msgId,
-              result.agentId,
-              targetMsg.transportScope
-            ),
+            sessionKey: sessionKeyForCoordinates(result.agentId, targetMsg, targetCoordinates),
             turnId: stableTurnId(result.agentId, msg)
           }),
           completion: topLevel.then(
@@ -7439,7 +7433,7 @@ export class Daemon {
       result.integrationId,
       undefined,
       undefined,
-      { deliveryId: `${stableMessageId(targetMsg)}#${result.agentId}` }
+      { deliveryId: `${stableMessageId(targetMsg)}#${result.agentId}`, coordinates: targetCoordinates }
     )
     turn.catch((err) => this.log.error(`dispatch failed for agent "${result.agentId}": ${formatErr(err)}`))
     return { kind: 'dispatched', handle }
@@ -7518,12 +7512,18 @@ export class Daemon {
       const targetMsg = { ...msg }
       if (via === 'mention') targetMsg.trigger = 'mention'
       else delete targetMsg.trigger
-      if (this.cfg.features.turnFinalContextRefresh) await this.recordObservedInbound(targetMsg, agentId)
-      const targetThread = targetMsg.thread ?? targetMsg.msgId
-      const muteKey = sessionKey(targetMsg.platform, targetMsg.channel, targetThread, agentId, targetMsg.transportScope)
+      const peerCoordinates = await this.sessionCoordinatesFor(agentId, targetMsg, rule.integrationId)
+      if (this.cfg.features.turnFinalContextRefresh)
+        await this.recordObservedInbound(targetMsg, agentId, true, peerCoordinates)
+      const muteKey = sessionKeyForCoordinates(agentId, targetMsg, peerCoordinates)
       if (await this.commands.isSessionMuted(muteKey)) {
         if (via === 'implicit') {
-          await this.recordObservedInbound(targetMsg, agentId, this.cfg.features.turnFinalContextRefresh)
+          await this.recordObservedInbound(
+            targetMsg,
+            agentId,
+            this.cfg.features.turnFinalContextRefresh,
+            peerCoordinates
+          )
           outcomes.push({ kind: 'rejected', reason: 'gated' })
           continue
         }
@@ -7536,7 +7536,7 @@ export class Daemon {
         rule.integrationId,
         undefined,
         undefined,
-        { deliveryId: `${stableMessageId(targetMsg)}#${agentId}` }
+        { deliveryId: `${stableMessageId(targetMsg)}#${agentId}`, coordinates: peerCoordinates }
       )
       turn.catch((err) => this.log.error(`thread fan-out failed for agent "${agentId}": ${formatErr(err)}`))
       outcomes.push({ kind: 'dispatched', handle })
@@ -7818,13 +7818,10 @@ export class Daemon {
     // `handleRelayIm` applies the `!stop` gate only on the path this branch returns
     // before, so an implicit continuation is checked against it here — otherwise a muted
     // conversation would silence its humans and none of its agents.
-    const muteKey = sessionKey(
-      normalized.platform,
-      normalized.channel,
-      normalized.thread ?? normalized.msgId,
-      msg.agentId,
-      normalized.transportScope
-    )
+    // The mute gate keys on the physical thread coordinate (synchronously): append-mode
+    // mute semantics land with runtime activation, and awaiting a reservation here would
+    // insert a scheduling tick ahead of the supersede ordering this path must preserve.
+    const muteKey = sessionKeyForCoordinates(msg.agentId, normalized, currentSessionCoordinates(normalized))
     if (via === 'implicit' && (await this.commands.isSessionMuted(muteKey))) {
       await this.recordUnrouted(normalized)
       this.log.debug(`relay: dropping agent-authored ${msg.msgId} for "${msg.agentId}" (muted by !stop)`)
@@ -7971,13 +7968,8 @@ export class Daemon {
     // while muted, implicit routing (thread affinity / keyword / auto / dm) never
     // dispatches — only an explicit @mention does, and it clears the mute. Muted traffic
     // still enters the transcript so the agent catches up when re-activated (§8.5).
-    const muteKey = sessionKey(
-      normalized.platform,
-      normalized.channel,
-      normalized.thread ?? normalized.msgId,
-      msg.agentId,
-      normalized.transportScope
-    )
+    // Keyed on the physical thread coordinate synchronously; see the relay IM gate above.
+    const muteKey = sessionKeyForCoordinates(msg.agentId, normalized, currentSessionCoordinates(normalized))
     trace.stage = 'mute'
     if (await this.commands.isSessionMuted(muteKey)) {
       if (normalized.trigger !== 'mention') {
@@ -8235,13 +8227,8 @@ export class Daemon {
    * provider's next redelivery runs it a second time.
    */
   private async mintLinearDeliveryReceipt(msg: RdMsgIm, normalized: NormalizedMessage): Promise<boolean> {
-    const key = sessionKey(
-      normalized.platform,
-      normalized.channel,
-      normalized.thread ?? normalized.msgId,
-      msg.agentId,
-      normalized.transportScope
-    )
+    const coordinates = await this.sessionCoordinatesFor(msg.agentId, normalized, msg.integrationId)
+    const key = sessionKeyForCoordinates(msg.agentId, normalized, coordinates)
     return await this.store.appendInbox({
       id: linearDeliveryReceiptId(stableMessageId(normalized)),
       sessionKey: key,
@@ -8272,13 +8259,8 @@ export class Daemon {
     const agent = this.agents.get(msg.agentId)
     const agentName = agent?.displayName?.trim() || agent?.name || msg.agentId
     void (async () => {
-      const key = sessionKey(
-        normalized.platform,
-        normalized.channel,
-        normalized.thread ?? normalized.msgId,
-        msg.agentId,
-        normalized.transportScope
-      )
+      const coordinates = await this.sessionCoordinatesFor(msg.agentId, normalized, msg.integrationId)
+      const key = sessionKeyForCoordinates(msg.agentId, normalized, coordinates)
       // `none` is truly silent (§5.2): no ack, no activities, no issue write — transcript only.
       const mode = (await this.store.getOutputModeOverride(key)) ?? agent?.output?.mode ?? 'low'
       if (mode === 'none') return
@@ -10910,6 +10892,8 @@ export class Daemon {
       /** Stable target-scoped inbox id for a physical event delivered to more
        * than one agent. It does not replace the provider transcript identity. */
       deliveryId?: string
+      /** Already resolved for this target before its mute/observation checks. */
+      coordinates?: SessionCoordinates
       /** Mint a permanent DELIVERY RECEIPT under this id, in the SAME transaction as the
        * admission row (see `LocalStore.appendInboxWithReceipt`). For a provider whose
        * redelivery ladder outlives the turn: the ordinary row is deleted at settlement, so
@@ -10926,6 +10910,7 @@ export class Daemon {
         accepted: boolean
         reason?: string
         duplicate?: boolean
+        sessionKey?: string
         /** The delivery rode the running turn over `_session/steering`; no queue entry exists. */
         steered?: boolean
       }) => void | Promise<void>
@@ -10945,8 +10930,11 @@ export class Daemon {
       msg.transportScope ??= this.transportScopeForIntegrationIds([integrationId])
     }
     // Resolve target-specific coordinates exactly once, before observation and admission.
-    // The QueueEntry carries this trusted decision through every later seam.
-    const coordinates = currentSessionCoordinates(msg)
+    // The QueueEntry carries this trusted decision through every later seam. An ingress
+    // that runs an `append` target resolves the reservation upstream and threads it in via
+    // `opts.coordinates`; the default stays synchronous so this seam never inserts a
+    // scheduling tick ahead of the supersede ordering the relay/hook paths depend on.
+    const coordinates = opts?.coordinates ?? currentSessionCoordinates(msg)
     // An agent-initiated wake's INBOUND message posts live too (#807 only posted the woken
     // REPLY, so the sender's message appeared on refresh but never in the live view). Mint
     // its canonical post identity before the inbox row persists so a replay reuses it and
@@ -11008,7 +10996,7 @@ export class Daemon {
               await this.store.releaseActivation(activationKey)
             }
           }
-          await opts?.onAdmission?.(result)
+          await opts?.onAdmission?.(result.accepted ? { ...result, sessionKey: key } : result)
         }
         // Drain gate for the dispatch entry itself — covers cron fires and `!queue`
         // that bypass onInbound's gate (§5.3: a draining unit starts no turn). Applied
@@ -16047,6 +16035,22 @@ export class Daemon {
     return undefined
   }
 
+  private sessionCoordinatesFor(
+    agentId: string,
+    msg: NormalizedMessage,
+    integrationId?: string
+  ): Promise<SessionCoordinates> {
+    const integration = integrationId
+      ? this.agents.get(agentId)?.integrations?.find((candidate) => candidate.id === integrationId)
+      : undefined
+    return resolveSessionCoordinates(
+      this.store,
+      agentId,
+      msg,
+      integration ? integrationSessionMode(integration, msg.channel) : 'createNew'
+    )
+  }
+
   /** The transport scope whose observed session history a history-backed MCP read may see: the integration the read named (#1965 — an explicit `integrationId`, the conversation's own bot, or the host's answer), else the agent's only bot on the platform, and undefined when nothing is attributable to one physical bot (the read then returns []). Re-checked against the agent's OWN integrations, so a stale session snapshot cannot widen it; a session that spanned several bots carries a `mixed:` scope and belongs to none of them. */
   private observedHistoryScope(agentId: string, platform: string, integrationId?: string): string | undefined {
     const integrations = this.agents.get(agentId)?.integrations.filter((i) => i.platform === platform) ?? []
@@ -19405,7 +19409,8 @@ export class Daemon {
     label: string,
     safetyReviewLane?: string
   ): Promise<AnchorTriggerResult> {
-    const key = sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
+    const coordinates = await this.sessionCoordinatesFor(agentId, msg, target?.integrationId)
+    const key = sessionKeyForCoordinates(agentId, msg, coordinates)
     // Gate BEFORE the anchor side effect. Cron scheduling remains registered while an
     // agent is paused, but a paused/draining/safety-stopping agent must publish nothing
     // and start no turn.
