@@ -24,7 +24,7 @@
  */
 import type { z, ZodType } from 'zod'
 import type { BindRuleConfig, Integration } from '../agents/agent-schema.js'
-import type { IntegrationSessionMode } from '@agentconnect.md/protocol'
+import type { ChannelSessionMode, IntegrationSessionMode } from '@agentconnect.md/protocol'
 import {
   DiscordConfigSchema,
   FeishuConfigSchema,
@@ -153,4 +153,9 @@ export function integrationCore(int: Integration): IntegrationCore {
     gated: core?.gated ?? false,
     sessionModes: core?.sessionModes ?? []
   }
+}
+
+/** The configured logical session policy for one provider conversation. */
+export function integrationSessionMode(int: Integration, channel: string): ChannelSessionMode {
+  return integrationCore(int).sessionModes.find((entry) => entry.channel === channel)?.mode ?? 'createNew'
 }

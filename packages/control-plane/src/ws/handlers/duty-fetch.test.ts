@@ -2,7 +2,7 @@
 // The load-bearing row is the authorization one: holding the duty is the ONLY
 // thing that entitles a daemon to an agent's bundle.
 import { describe, expect, it, vi } from 'vitest'
-import type { AnyFrame } from '@agentconnect.md/protocol'
+import { CONVERSATION_SESSION_MODE_V1_FEATURE, type AnyFrame } from '@agentconnect.md/protocol'
 import type { DaemonConnection } from '../connection.js'
 import type { DaemonWsDeps } from '../deps.js'
 import { handleDutyFetch } from './duty-fetch.js'
@@ -66,8 +66,13 @@ function fakeConn(orgId: string | null = null, setId: string | null = SET) {
 
 /** The per-connection id→org maps `register` normally builds. A duty holder that
  *  installed mid-session never registered these resources, so they start empty. */
-function fakeScopes() {
-  return { orgByAgent: new Map<string, string>(), orgByIntegration: new Map(), orgByCron: new Map() }
+function fakeScopes(features?: string[]) {
+  return {
+    orgByAgent: new Map<string, string>(),
+    orgByIntegration: new Map(),
+    orgByCron: new Map(),
+    capabilities: { features }
+  }
 }
 
 function fakeDeps(
@@ -87,6 +92,30 @@ function fakeDeps(
 }
 
 describe('handleDutyFetch', () => {
+  it('withholds append integrations from an old member but keeps them for an upgraded member', async () => {
+    const bundle = {
+      ...BUNDLE,
+      integrations: BUNDLE.integrations.map((integration) => ({
+        ...integration,
+        core: { ...integration.core, sessionModes: [{ channel: 'C1', mode: 'append' as const }] }
+      }))
+    }
+    for (const [features, count] of [
+      [[], 0],
+      [[CONVERSATION_SESSION_MODE_V1_FEATURE], 1]
+    ] as const) {
+      const conn = fakeConn()
+      await handleDutyFetch(
+        fetchFrame(),
+        conn,
+        fakeDeps(
+          { agent: AGENT_RECORD, holdsAgent: true, agentBundle: vi.fn(async () => bundle) },
+          fakeScopes([...features])
+        )
+      )
+      expect(conn.replyTo.mock.calls[0]?.[2].bundle.integrations).toHaveLength(count)
+    }
+  })
   it('refuses a connection in no member set — membership is the door', async () => {
     const conn = fakeConn(ORG, null)
     const agentBundle = vi.fn(async () => BUNDLE)

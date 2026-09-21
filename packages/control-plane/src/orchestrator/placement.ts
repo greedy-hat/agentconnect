@@ -66,6 +66,7 @@ import {
   type MemoryDefinitionDeps
 } from './agentDefinitions.js'
 import { daemonSupportsAgent, encodeSpecWorkspaceForPeer, requiredDaemonFeatures } from '../domain/daemon-features.js'
+import { daemonSupportsIntegration, requiredIntegrationFeatures } from '../domain/integration-features.js'
 import type { AgentId, DaemonId } from '../domain/ids.js'
 import { AgentId as toAgentId, DaemonId as toDaemonId, IntegrationId as toIntegrationId } from '../domain/ids.js'
 import { sessionKeyStr, type SessionKey } from '../domain/sessionKey.js'
@@ -516,6 +517,13 @@ export class Placement implements ReconcileService {
             // The bot behind one of the reconciling daemon's integration rows.
             this.bots.getUnscoped(i.botId)
           ])
+          if (!daemonSupportsIntegration(channels, req.capabilities.features)) {
+            this.orch?.log?.warn(
+              { integrationId: i.id, agentId: i.agentId, daemonId, required: requiredIntegrationFeatures(channels) },
+              'withholding integration from snapshot: daemon lacks a required feature'
+            )
+            return null
+          }
           // A spec needs BOTH halves of its identity: the bot row (the projector's
           // required input — credentials shape, transport, demux identity) and the
           // decrypted secret. Either missing ⇒ no deliverable spec, and the roster

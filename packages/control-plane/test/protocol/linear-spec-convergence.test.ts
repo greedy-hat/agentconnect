@@ -13,7 +13,7 @@
  * from `integrations` AND presence in `drop.integrations`, which is what makes the daemon remove it.
  */
 import { describe, it, expect } from 'vitest'
-import { isFrame } from '@agentconnect.md/protocol'
+import { CONVERSATION_SESSION_MODE_V1_FEATURE, isFrame } from '@agentconnect.md/protocol'
 import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { buildWsHarness, TEST_LINEAR_APP } from '../fakes/build-ws.js'
@@ -77,10 +77,10 @@ async function seedConnectedWorkspace(): Promise<void> {
 }
 
 /** The daemon reports it already holds the CP-owned integration — the replica at risk. */
-function registerPayload() {
+function registerPayload(features: string[] = []) {
   return {
     host: 'host-1',
-    capabilities: { platforms: ['linear'], runtimes: ['claude'], acp: true },
+    capabilities: { platforms: ['linear'], runtimes: ['claude'], acp: true, features },
     maxAgents: 4,
     localState: {
       assignments: [],
@@ -93,18 +93,33 @@ function registerPayload() {
   }
 }
 
-async function snapshot(h: ReturnType<typeof buildWsHarness>) {
+async function snapshot(h: ReturnType<typeof buildWsHarness>, features: string[] = []) {
   const token = await h.mintToken(DAEMON)
   const { stub } = h.connect()
   stub.inject('auth', { apiKey: token, daemonId: DAEMON, agentVersion: '1.4.0' }, { id: AUTH_ID })
   await stub.expectFrame('auth/ok')
-  stub.inject('register', registerPayload(), { id: REG_ID })
+  stub.inject('register', registerPayload(features), { id: REG_ID })
   const ok = await stub.expectFrame('register/ok')
   if (!isFrame('register/ok')(ok)) throw new Error('expected register/ok')
   return ok.payload
 }
 
 describe('a Linear workspace whose grant is gone converges to removal', () => {
+  it('withholds persisted append from an old daemon and projects it to a capable daemon', async () => {
+    await seedConnectedWorkspace()
+    await prisma.integrationChannel.create({
+      data: { integrationId: INTEGRATION, channelId: 'team_eng', name: 'Engineering', sessionMode: 'append' }
+    })
+
+    const old = await snapshot(buildWsHarness(prisma))
+    expect(old.integrations).toEqual([])
+    expect(old.drop.integrations).toEqual([INTEGRATION])
+
+    const upgraded = await snapshot(buildWsHarness(prisma), [CONVERSATION_SESSION_MODE_V1_FEATURE])
+    expect(upgraded.integrations).toHaveLength(1)
+    expect(upgraded.integrations[0]?.core.sessionModes).toEqual([{ channel: 'team_eng', mode: 'append' }])
+    expect(upgraded.drop.integrations).toEqual([])
+  })
   it('delivers the integration while the grant is live', async () => {
     await seedConnectedWorkspace()
     const snap = await snapshot(buildWsHarness(prisma))

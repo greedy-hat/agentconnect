@@ -142,6 +142,7 @@ import {
  */
 import { createHash } from 'node:crypto'
 import { daemonSupportsAgent, encodeSpecWorkspaceForPeer } from '../domain/daemon-features.js'
+import { daemonSupportsIntegrationSpec } from '../domain/integration-features.js'
 import {
   MAX_ORGANIZATION_SUGGESTION_BODY_BYTES,
   ORGANIZATION_SUGGESTION_CHUNK_BYTES,
@@ -373,6 +374,9 @@ export class ControlSender {
       if (!daemonSupportsAgent(a.spec, c.capabilities?.features)) {
         throw new Error(`daemon ${daemonId} lacks a feature required by agent ${a.agentId}'s spec`)
       }
+      if (a.integrations.some((integration) => !daemonSupportsIntegrationSpec(integration, c.capabilities?.features))) {
+        throw new Error(`daemon ${daemonId} lacks a feature required by an integration of agent ${a.agentId}`)
+      }
       try {
         return await c.conn.request<Ack>(
           'agent/activate',
@@ -437,6 +441,7 @@ export class ControlSender {
    */
   async integrationUpsert(daemonId: string, u: IntegrationUpsert): Promise<void> {
     const c = this.must(daemonId)
+    if (!daemonSupportsIntegrationSpec(u, c.capabilities?.features)) return
     c.conn.send('integration/upsert', u, { epoch: c.sessionEpoch, agentId: u.agentId })
   }
 

@@ -452,6 +452,7 @@ export function slackInstallRoutes(deps: HttpDeps, slack: SlackRouteSeams) {
             botId: integration.botId,
             status: integration.status,
             createdAt: integration.createdAt.toISOString(),
+            supportsAppendSessionMode: false,
             channels: []
           })
         } finally {

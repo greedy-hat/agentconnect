@@ -72,6 +72,48 @@ function TriggerToggle({
   )
 }
 
+function SessionModeSelect({
+  channel,
+  disabled,
+  supportsAppend,
+  onChange
+}: {
+  channel: IntegrationChannelRow
+  disabled: boolean
+  supportsAppend: boolean
+  onChange: (mode: NonNullable<IntegrationChannelRow['sessionMode']>) => Promise<void>
+}) {
+  const [saving, setSaving] = useState(false)
+  const mode = channel.sessionMode ?? 'createNew'
+  return (
+    <label className="inline-flex items-center gap-2 text-[12px] text-(--text-tertiary)">
+      <span>Session</span>
+      <select
+        className="selbtn h-[30px]"
+        aria-label={`Session for ${rowLabel(channel)}`}
+        value={mode}
+        disabled={disabled || saving}
+        title={
+          mode === 'append'
+            ? 'Messages across this channel continue one agent session; replies appear where each question was asked.'
+            : 'Each new conversation thread starts a separate agent session.'
+        }
+        onChange={(event) => {
+          const next = event.target.value as NonNullable<IntegrationChannelRow['sessionMode']>
+          if (next === mode) return
+          setSaving(true)
+          void onChange(next).finally(() => setSaving(false))
+        }}
+      >
+        <option value="createNew">Per thread</option>
+        <option value="append" disabled={!supportsAppend}>
+          Continuous{supportsAppend ? '' : ' · upgrade required'}
+        </option>
+      </select>
+    </label>
+  )
+}
+
 /** One band of the channel list: the rows of a single Discord server, with the header
  *  to print above them (absent ⇒ no header, the flat lead group). */
 export interface SpaceGroup {
@@ -556,8 +598,17 @@ export function IntegrationChannelList({
   /** Horizontal row padding, to line up with the host card (18 list / 14 detail). */
   padX?: number
 }) {
-  const { setChannelTrigger, setChannelAgent, forgetChannel, leaveConversation, bots, agents, integrations } =
-    useConsoleData()
+  const {
+    setChannelTrigger,
+    setChannelSessionMode,
+    setChannelAgent,
+    forgetChannel,
+    leaveConversation,
+    bots,
+    agents,
+    integrations
+  } = useConsoleData()
+  const supportsAppend = integrations.find((row) => row.id === integrationId)?.supportsAppendSessionMode === true
   const ownerGuard = useOwnerChangeGuard()
   // A derived roster is the platform's own list — nothing is observed into it, and nothing is dropped from here.
   const derivedRoster = channelListSemantics(platform).roster === 'derived'
@@ -688,6 +739,14 @@ export function IntegrationChannelList({
             disabled={!integrationId}
             onChange={(trigger) => setChannelTrigger(integrationId!, c.channelId, trigger)}
           />
+          {!isDirectConversation(c.kind) && (
+            <SessionModeSelect
+              channel={c}
+              disabled={!integrationId}
+              supportsAppend={supportsAppend}
+              onChange={(mode) => act(() => setChannelSessionMode(integrationId!, c.channelId, mode))}
+            />
+          )}
           {/* Demo rows carry no button rather than an inert one, and a derived roster none at all — the
               platform owns the list. Which of the two callbacks a row spends is `rowMenuAction`'s call. */}
           {integrationId && !derivedRoster && (

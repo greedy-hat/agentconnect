@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { GITLAB_COM_V1_FEATURE } from '@agentconnect.md/protocol'
+import {
+  CONVERSATION_SESSION_MODE_V1_FEATURE,
+  GITLAB_COM_V1_FEATURE,
+  type IntegrationSpec
+} from '@agentconnect.md/protocol'
 import { AgentDelivery } from './agentDelivery.js'
 import type { AgentSpecAssembler } from './agentSpecAssembler.js'
 import type { AgentRecord } from '../persistence/ports.js'
@@ -23,7 +27,9 @@ function harness(features: readonly string[] | undefined) {
         sent.push(daemonId)
       },
       agentRemove: async () => {},
-      integrationUpsert: async () => {},
+      integrationUpsert: async (daemonId: string) => {
+        sent.push(daemonId)
+      },
       integrationRemove: async () => {},
       cronUpsert: async () => ({ ok: true }),
       cronRemove: async () => ({ ok: true })
@@ -51,5 +57,15 @@ describe('AgentDelivery §17.3 projection gate', () => {
     const { delivery, sent } = harness([GITLAB_COM_V1_FEATURE])
     await delivery.upsert(agentWith('gitlab'), () => {})
     expect(sent).toEqual([DAEMON])
+  })
+
+  it('withholds append integration updates until the target advertises session mode support', async () => {
+    const spec = { core: { sessionModes: [{ channel: 'C1', mode: 'append' }] } } as IntegrationSpec
+    const old = harness(undefined)
+    await old.delivery.integrationUpsert(agentWith('github'), spec, () => {})
+    expect(old.sent).toEqual([])
+    const upgraded = harness([CONVERSATION_SESSION_MODE_V1_FEATURE])
+    await upgraded.delivery.integrationUpsert(agentWith('github'), spec, () => {})
+    expect(upgraded.sent).toEqual([DAEMON])
   })
 })

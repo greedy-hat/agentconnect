@@ -25,6 +25,7 @@ import {
   type DaemonRow,
   type MemberSetRow,
   type IntegrationRow,
+  type IntegrationChannelRow,
   type Session
 } from '@/lib/data'
 import {
@@ -252,6 +253,11 @@ interface ConsoleData {
   deleteHook: (id: string, agentId?: string | null) => Promise<void>
   /** Per-conversation trigger choice (PATCH), applied to the local row on success. */
   setChannelTrigger: (integrationId: string, channelId: string, trigger: ChannelTrigger) => Promise<void>
+  setChannelSessionMode: (
+    integrationId: string,
+    channelId: string,
+    sessionMode: NonNullable<IntegrationChannelRow['sessionMode']>
+  ) => Promise<void>
   /** Per-conversation default agent for a shared bot (PATCH), applied locally. */
   setChannelAgent: (integrationId: string, channelId: string, agentId: string) => Promise<void>
   /** Forget a conversation row without touching the platform. */
@@ -333,6 +339,7 @@ function integrationRowFromDto(
     agentId: d.agentId,
     botId: d.botId,
     shareable: bot?.shareable ?? false,
+    supportsAppendSessionMode: d.supportsAppendSessionMode ?? false,
     discordAppId: bot?.discordAppId ?? null,
     ...(d.platform === 'feishu' ? { region: d.region ?? bot?.feishuRegion ?? 'feishu' } : {}),
     name: d.name,
@@ -352,6 +359,7 @@ function integrationRowFromDto(
       ...(c.url ? { url: c.url } : {}),
       kind: c.kind,
       trigger: c.trigger,
+      sessionMode: c.sessionMode,
       agentId: c.agentId
     }))
   }
@@ -1435,6 +1443,37 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
     [mutateIntegrations, realBots]
   )
 
+  const setChannelSessionMode = useCallback(
+    async (
+      integrationId: string,
+      channelId: string,
+      sessionMode: NonNullable<IntegrationChannelRow['sessionMode']>
+    ) => {
+      await apiUpdateIntegrationChannel(integrationId, channelId, { sessionMode })
+      settleInBackground(
+        mutateIntegrations(
+          (rows) => {
+            const source = rows?.find((row) => row.id === integrationId)
+            if (!rows || !source) return rows
+            const botWide = realBots.some((bot) => bot.id === source.botId && bot.shareable)
+            return rows.map((row) =>
+              (botWide ? row.botId === source.botId : row.id === integrationId)
+                ? {
+                    ...row,
+                    channels: row.channels.map((channel) =>
+                      channel.channelId === channelId ? { ...channel, sessionMode } : channel
+                    )
+                  }
+                : row
+            )
+          },
+          { revalidate: false }
+        )
+      )
+    },
+    [mutateIntegrations, realBots]
+  )
+
   /**
    * Drop a conversation from the cache. Both channel actions end the same way — the
    * row is gone — so they share one projection, applied bot-wide for a channel of a
@@ -1695,6 +1734,7 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
       deleteHook,
       deleteBot,
       setChannelTrigger,
+      setChannelSessionMode,
       forgetChannel,
       leaveConversation,
       setChannelAgent,
@@ -1778,6 +1818,7 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
       deleteHook,
       deleteBot,
       setChannelTrigger,
+      setChannelSessionMode,
       setChannelAgent,
       setBotShareable,
       saveCron,

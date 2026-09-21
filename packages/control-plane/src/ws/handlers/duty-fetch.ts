@@ -6,6 +6,7 @@
 import { isFrame, type DutyAgentBundle } from '@agentconnect.md/protocol'
 import { AgentId, DaemonId } from '../../domain/ids.js'
 import { encodeSpecWorkspaceForPeer } from '../../domain/daemon-features.js'
+import { daemonSupportsIntegrationSpec } from '../../domain/integration-features.js'
 import type { DaemonWsDeps } from '../deps.js'
 import { frameOrgId } from './frame-org.js'
 import type { Handler } from './index.js'
@@ -36,11 +37,15 @@ export const handleDutyFetch: Handler = async (frame, conn, deps) => {
     return
   }
   const bundle = await deps.agentBundle(agent)
-  rememberScopes(conn.daemonId, deps, bundle)
   // Workspace dual-encoded per the asking member's advertised features (§8).
   const features = deps.connReg.get(conn.daemonId)?.capabilities?.features
+  const safeBundle = {
+    ...bundle,
+    integrations: bundle.integrations.filter((integration) => daemonSupportsIntegrationSpec(integration, features))
+  }
+  rememberScopes(conn.daemonId, deps, safeBundle)
   conn.replyTo(frame, 'duty/fetch/ok', {
-    bundle: { ...bundle, spec: encodeSpecWorkspaceForPeer(bundle.spec, features) }
+    bundle: { ...safeBundle, spec: encodeSpecWorkspaceForPeer(bundle.spec, features) }
   })
 }
 

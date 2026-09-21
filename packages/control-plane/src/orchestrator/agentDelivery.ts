@@ -22,6 +22,7 @@ import type { AgentSpecAssembler } from './agentSpecAssembler.js'
 import type { ControlSender } from './outbound.js'
 import { PLACEMENT_ONLY, type PlacementResolver, type ResolvableAgent } from './placementResolver.js'
 import { daemonSupportsAgent } from '../domain/daemon-features.js'
+import { daemonSupportsIntegrationSpec } from '../domain/integration-features.js'
 import type { AgentRecord } from '../persistence/ports.js'
 
 export type { DutyHolderReader } from './placementResolver.js'
@@ -138,7 +139,9 @@ export class AgentDelivery {
    *  payload IS the explicit org — and sending it also teaches the connection's
    *  id→org map, which is why upserts never had this problem. */
   async integrationUpsert(agent: ResolvableAgent, spec: IntegrationSpec, onError: DeliveryErrorHandler): Promise<void> {
-    const targets = await this.daemonsFor(agent)
+    const targets = (await this.daemonsFor(agent)).filter((daemonId) =>
+      daemonSupportsIntegrationSpec(spec, this.deps.daemonFeatures?.(daemonId))
+    )
     await this.fanOut(targets, onError, (daemonId) => this.deps.control.integrationUpsert(daemonId, spec))
   }
 

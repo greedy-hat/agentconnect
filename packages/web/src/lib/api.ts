@@ -876,6 +876,7 @@ export interface SlackConfigInput {
 // How the bot activates in one conversation: not at all ('off' — conversation
 // gating for restricted agents), only when @-mentioned, or on any message.
 export type ChannelTrigger = 'off' | 'mention' | 'any'
+export type ChannelSessionMode = 'createNew' | 'append'
 
 // One conversation the integration's bot is in (daemon-reported) + its trigger
 // choice. kind 'im' rows are DM conversations and 'mpim' rows are Slack group DMs;
@@ -892,6 +893,7 @@ export interface IntegrationChannelDto {
   isPrivate: boolean
   kind: 'channel' | 'im' | 'mpim'
   trigger: ChannelTrigger
+  sessionMode: ChannelSessionMode
   agentId: string | null // effective shared-conversation owner; null before convergence / when not applicable
 }
 
@@ -905,6 +907,7 @@ export interface IntegrationDto {
   status: string
   region?: 'feishu' | 'lark' // feishu integrations only: which open-platform gateway
   createdAt: string // ISO-8601
+  supportsAppendSessionMode: boolean
   channels: IntegrationChannelDto[]
 }
 
@@ -4203,7 +4206,7 @@ export async function fetchHookRuns(id: string, orgId?: string): Promise<HookRun
 export async function updateIntegrationChannel(
   integrationId: string,
   channelId: string,
-  patch: { trigger?: ChannelTrigger; agentId?: string },
+  patch: { trigger?: ChannelTrigger; sessionMode?: ChannelSessionMode; agentId?: string },
   orgId?: string
 ): Promise<IntegrationChannelDto> {
   return apiPatch<IntegrationChannelDto>(

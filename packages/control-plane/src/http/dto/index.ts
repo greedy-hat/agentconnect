@@ -939,6 +939,7 @@ export const IntegrationDto = z.object({
   status: z.string(),
   region: FeishuRegion.optional(), // feishu integrations only: 'feishu' | 'lark' gateway
   createdAt: z.string(), // ISO-8601
+  supportsAppendSessionMode: z.boolean(),
   channels: z.array(IntegrationChannelDto)
 })
 export const IntegrationListDto = z.array(IntegrationDto)

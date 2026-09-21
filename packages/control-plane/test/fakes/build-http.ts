@@ -378,7 +378,13 @@ export function buildHttpApp(
     hookRepo,
     giteaSeam?.api.baseUrl
   )
-  const agentDelivery = new AgentDelivery({ control: sender, specs: agentSpecs, placement: placementResolver })
+  const agentDelivery = new AgentDelivery({
+    control: sender,
+    specs: agentSpecs,
+    placement: placementResolver,
+    daemonFeatures: (daemonId) =>
+      (liveness.get(daemonId) as { capabilities?: { features: string[] } } | undefined)?.capabilities?.features
+  })
 
   // LATE-BOUND exactly as `buildContainer` binds it (§9): the providers below are
   // constructed WITH this dep bundle, because their funnel plugins are route
