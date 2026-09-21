@@ -928,7 +928,7 @@ function restrictPath(path: string, mode: number): void {
  * fresh databases and every established one fails at query time. `SCHEMA_MIGRATIONS`
  * asserts the two stay in lockstep for exactly that reason.
  */
-const SCHEMA_VERSION = 20
+const SCHEMA_VERSION = 21
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -1114,7 +1114,9 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean }) => Promise<v
     await db.exec(`
       ALTER TABLE sessions ADD COLUMN executorDaemonId TEXT;
       ALTER TABLE sessions ADD COLUMN stayedHomeReason TEXT;
-    `)
+    `),
+  // Append reservation and its durable high-water mark are emitted by the CREATE block.
+  async () => undefined
 ]
 
 // The list and the version are two halves of one fact: step `i` moves a database from
@@ -1230,6 +1232,17 @@ export class LocalStore {
         conversationKind TEXT, tenantScope TEXT, launchCorrelationId TEXT,
         platformStanding TEXT,
         executorDaemonId TEXT, stayedHomeReason TEXT
+      );
+      CREATE TABLE IF NOT EXISTS append_session_reservation (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        coordinate TEXT NOT NULL, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope)
+      );
+      -- A cleared reservation must not let a backward clock reuse a surviving transcript coordinate.
+      CREATE TABLE IF NOT EXISTS append_session_clock (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        maxMillis INTEGER NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope)
       );
       -- A !stop can arrive while a cold session is still materializing, before the
       -- sessions row exists. Keep the mute independently keyed so that stop survives a
@@ -1845,6 +1858,100 @@ export class LocalStore {
   private async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
     await this.drainToolCallWrites()
     return this.backend.transaction(fn)
+  }
+
+  /** Resolve one conversation's append coordinate before inbox admission. The row is authoritative
+   *  even before a sessions row exists; competing first messages read the same insert winner. */
+  async resolveAppendReservation(
+    agentId: string,
+    channel: string,
+    transportScope = '',
+    now = Date.now()
+  ): Promise<string> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const existing = (await tx
+        .prepare(
+          'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+        )
+        .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+      if (existing) return existing.coordinate
+      const previous = (await tx
+        .prepare('SELECT maxMillis FROM append_session_clock WHERE agentId = ? AND channel = ? AND transportScope = ?')
+        .get(agentId, channel, transportScope)) as { maxMillis: number } | undefined
+      const millis = Math.max(now, Number(previous?.maxMillis ?? 0) + 1)
+      const proposed = `append:${millis}`
+      const inserted = await tx
+        .prepare(
+          `INSERT OR IGNORE INTO append_session_reservation
+           (agentId, channel, transportScope, coordinate, updatedAt) VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(agentId, channel, transportScope, proposed, now)
+      if (Number(inserted.changes) > 0) {
+        await tx
+          .prepare(
+            `INSERT INTO append_session_clock (agentId, channel, transportScope, maxMillis)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (agentId, channel, transportScope) DO UPDATE SET maxMillis = excluded.maxMillis`
+          )
+          .run(agentId, channel, transportScope, millis)
+        return proposed
+      }
+      const winner = (await tx
+        .prepare(
+          'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+        )
+        .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+      if (!winner) throw new Error('append reservation disappeared during resolution')
+      return winner.coordinate
+    })
+  }
+
+  /** CAS rotation for !new. A losing caller reads the winner and never advances again. */
+  async advanceAppendReservation(
+    agentId: string,
+    channel: string,
+    transportScope: string,
+    expected: string,
+    now = Date.now()
+  ): Promise<{ coordinate: string; advanced: boolean } | undefined> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const current = (await tx
+        .prepare(
+          'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+        )
+        .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+      if (!current) return undefined
+      if (current.coordinate !== expected) return { coordinate: current.coordinate, advanced: false }
+      const previous = (await tx
+        .prepare('SELECT maxMillis FROM append_session_clock WHERE agentId = ? AND channel = ? AND transportScope = ?')
+        .get(agentId, channel, transportScope)) as { maxMillis: number } | undefined
+      const millis = Math.max(now, Number(previous?.maxMillis ?? 0) + 1)
+      const coordinate = `append:${millis}`
+      const updated = await tx
+        .prepare(
+          `UPDATE append_session_reservation SET coordinate = ?, updatedAt = ?
+           WHERE agentId = ? AND channel = ? AND transportScope = ? AND coordinate = ?`
+        )
+        .run(coordinate, now, agentId, channel, transportScope, expected)
+      if (Number(updated.changes) === 0) {
+        const winner = (await tx
+          .prepare(
+            'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+          )
+          .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+        return winner ? { coordinate: winner.coordinate, advanced: false } : undefined
+      }
+      await tx
+        .prepare(
+          `INSERT INTO append_session_clock (agentId, channel, transportScope, maxMillis)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (agentId, channel, transportScope) DO UPDATE SET maxMillis = excluded.maxMillis`
+        )
+        .run(agentId, channel, transportScope, millis)
+      return { coordinate, advanced: true }
+    })
   }
 
   async getSession(key: string): Promise<SessionRecord | undefined> {
@@ -3262,6 +3369,14 @@ export class LocalStore {
           .run(rec.agentId, outward, purge.reason, purge.at, purge.ownerId ?? null, purge.at)
       }
       await tx.prepare('DELETE FROM sessions WHERE key = ?').run(key)
+      if (rec.thread?.startsWith('append:') && rec.agentId && rec.channel) {
+        await tx
+          .prepare(
+            `DELETE FROM append_session_reservation
+             WHERE agentId = ? AND channel = ? AND transportScope = ? AND coordinate = ?`
+          )
+          .run(rec.agentId, rec.channel, rec.transportScope ?? '', rec.thread)
+      }
       // Its identity goes with it: the receipt just reported this id as purged, so the next
       // session on the same slot must be a new one, not this one's name reused.
       await tx.prepare('DELETE FROM session_outward_ids WHERE key = ?').run(key)

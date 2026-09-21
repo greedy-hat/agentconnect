@@ -91,6 +91,7 @@ export const canonicalColumns = [
   'loopGuardCounted',
   'mainAgentId',
   'mainSessionKey',
+  'maxMillis',
   'manifestDigest',
   'memoryHome',
   'memoryProvider',

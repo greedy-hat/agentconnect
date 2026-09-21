@@ -89,6 +89,18 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     return v
   }
 
+  it('adds append reservation tables when upgrading an existing v20 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v20-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE append_session_reservation; DROP TABLE append_session_clock; PRAGMA user_version = 20;')
+    old.close()
+    const upgraded = await LocalStore.open(path)
+    expect(await upgraded.resolveAppendReservation('a', 'C1', 'bot', 1000)).toBe('append:1000')
+    await upgraded.close()
+    expect(userVersion(path)).toBe(21)
+  })
+
   it('stamps a freshly created store with the current schema version', async () => {
     // A new database gets the whole schema from the CREATE block, so it must skip
     // the upgrade list outright rather than replay it.
@@ -165,7 +177,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     expect(cronColumns).toContain('definition')
     // Purge receipts are leased per pool member (#1032).
     expect(purgeColumns).toEqual(expect.arrayContaining(['ownerId', 'claimedAt']))
-    expect(userVersion(path)).toBe(20)
+    expect(userVersion(path)).toBe(21)
   })
 
   it.skipIf(pg)('never persists the CP routing map on a shared store, and still does on an owned one', async () => {
@@ -232,7 +244,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     expect(await upgraded.isCaptureExcluded('bot-c', 'c')).toBe(true)
     await upgraded.close()
 
-    expect(userVersion(path)).toBe(20)
+    expect(userVersion(path)).toBe(21)
   })
 
   it('re-keys the runtime catalog cache on its owning member when upgrading a v7 store', async () => {
@@ -288,7 +300,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
         .map((column) => column.name)
     expect(primaryKey(metaColumns)).toEqual(['ownerId', 'runtimeId'])
     expect(primaryKey(capColumns)).toEqual(['ownerId', 'runtimeId', 'modelId'])
-    expect(userVersion(path)).toBe(20)
+    expect(userVersion(path)).toBe(21)
   })
 
   it('backfills a v11 store with the outward id its sessions were already reported under', async () => {
@@ -316,7 +328,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     expect((await upgraded.getSession('k2'))?.sessionId).toBeNull()
     expect(await upgraded.ensureOutwardSessionId('k2', 'bot-a')).toMatch(/^[0-9a-f-]{36}$/)
     await upgraded.close()
-    expect(userVersion(path)).toBe(20)
+    expect(userVersion(path)).toBe(21)
   })
 
   // The regression that made `directDestination` reachable on fresh databases only: the step was
@@ -342,7 +354,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     await upgraded.setSessionClassification('k1', { sourceBindingKind: 'external', directDestination: true })
     expect(await upgraded.getSessionClassification('bot-a', 'acp-1')).toMatchObject({ directDestination: true })
     await upgraded.close()
-    expect(userVersion(path)).toBe(20)
+    expect(userVersion(path)).toBe(21)
   })
 
   it('refuses a store written by a newer daemon WITHOUT touching it first', async () => {
@@ -2770,6 +2782,6 @@ it.skipIf(pg)('upgrades a v17 store to durable memory continuations without chan
   expect(await upgraded.getMemoryEntryContinuation('bot-a', token, 999)).toBe('{"page":2}')
   await upgraded.close()
   const check = new DatabaseSync(path)
-  expect(check.prepare('PRAGMA user_version').get()).toEqual({ user_version: 20 })
+  expect(check.prepare('PRAGMA user_version').get()).toEqual({ user_version: 21 })
   check.close()
 })
