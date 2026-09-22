@@ -1,5 +1,10 @@
 # PR 1 — Session / Delivery Coordinate Plumbing
 
+> Scope: this is an incremental implementation plan, not the full release boundary.
+> See the [complete roadmap](agentconnect-improvement-roadmap.md), especially packages
+> C1–C7. Physical participation, durable coordinate replay, reset/command UX, audience
+> enforcement, and bounded history must all pass before append capability is advertised.
+
 ## Goal
 
 Separate provider delivery coordinates from logical session identity without changing any user-visible behavior.
@@ -59,9 +64,7 @@ export interface SessionCoordinates {
   readonly sessionThread: string
 }
 
-export function currentSessionCoordinates(
-  msg: NormalizedMessage
-): SessionCoordinates {
+export function currentSessionCoordinates(msg: NormalizedMessage): SessionCoordinates {
   const thread = msg.thread ?? msg.msgId
   return {
     deliveryThread: thread,
@@ -187,14 +190,9 @@ Then inside `SessionManager.handle()`:
 ```ts
 const coordinates = options.coordinates
 
-const { thread: transcriptThread, ts } =
-  transcriptCoords(msg, coordinates)
+const { thread: transcriptThread, ts } = transcriptCoords(msg, coordinates)
 
-const key = sessionKeyForCoordinates(
-  agentId,
-  msg,
-  coordinates
-)
+const key = sessionKeyForCoordinates(agentId, msg, coordinates)
 ```
 
 All session/transcript semantics should now use `coordinates.sessionThread`.

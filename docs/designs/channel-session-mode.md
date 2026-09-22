@@ -1,6 +1,7 @@
 # Per-Conversation Session Mode
 
-> Status: Proposed — not implemented.
+> Status: proposed target design; foundations are partially implemented.
+> Release gates and cross-feature contracts: [Improvement Roadmap](../proposals/agentconnect-improvement-roadmap.md).
 > Scope: chat conversations that are channels, on every platform that has them, over
 > both daemon-owned and relay-forwarded ingress.
 > Primary implementation areas: `packages/protocol`, `packages/control-plane`,
@@ -134,35 +135,17 @@ derive a coordinate of their own:
 
 The coordinate is **`(agent, channel, timestamp)`**, spelled `append:<epochMs>` in the
 `thread` segment of the session key (which already carries the agent and the channel).
-"Append" means: find the **largest** timestamp among this
-`(agent, channel, transportScope)`'s append coordinates and join it; if there is none,
-mint one.
+"Append" means: atomically resolve the current reservation for
+`(agent, channel, transportScope)`; if none exists, reserve a fresh coordinate.
 
-**Why a timestamp and not a counter.** A counter has to be derived from something that
-survives. Deriving it from session rows does not work: retention GC deletes session rows
-after an idle window (§6.3) but deliberately leaves transcript rows behind, because those
-are `(channel, thread)`-scoped and outlive any one session. A counter derived from rows
-would reset to zero after a quiet period and mint `append:0` again — a coordinate whose
-transcript is still sitting there, so the new session would inherit the retired
-conversation's history. A timestamp needs no surviving state: the clock only moves
-forward, so a coordinate minted after a purge is one that has never been used.
+**Uniqueness survives retention.** Mint with `max(now, persistedHighWater + 1)`
+using a durable clock that survives deletion of sessions and reservations. Wall time alone
+can move backwards and is not sufficient. A counter with the same durable high-water
+property could also work; timestamps are the chosen coordinate spelling, not the safety
+mechanism. The reservation below is authoritative, not a maximum reconstructed from sessions.
 
-The same property answers what happens to a conversation that goes quiet past the
-retention window: its session row, ACP session id, and worktree are gone, so its model
-context is gone regardless. Minting a fresh coordinate reports that honestly instead of
-presenting a continuation that cannot continue.
-
-Two mechanics follow:
-
-- **Mint monotonically**, `max(now, currentMax + 1)`, so a clock adjustment cannot make
-  `!new` silently no-op by minting a timestamp below the current maximum. `monotonicTs()`
-  in the session manager is the existing precedent.
-- **The maximum lookup must not require an ACP session id.** `!new` writes a bare session
-  row at the new coordinate, and a row that has never run a turn has no ACP id yet — so
-  `latestSessionForTransport` (`local-store.ts`), which filters on
-  `acpSessionId IS NOT NULL`, cannot serve this. `latestSessionForThread` next to it
-  exists for exactly this reason: its comment records that it omits that filter "so a stop
-  still reaches a turn that has not spawned yet".
+Retention creates a fresh generation only after the previous session is deleted and its
+reservation conditionally cleared. Missing ACP/session rows do not imply a stale reservation.
 
 The coordinate is a reserved shape, not a platform value, and cannot collide with a real
 one — a platform thread id is a provider timestamp, a snowflake, or a numeric message id,
@@ -187,7 +170,7 @@ The current coordinate therefore lives in its own reservation row, keyed
 - **Advance** (`!new`) — a compare-and-set from the coordinate the caller read to a newly
   minted one. **A caller that loses the CAS does not retry the advance.** It re-reads,
   sees a coordinate minted after its own read, and concludes that the rotation it wanted
-  has already happened — so two `!new` commands issued simultaneously advance the
+  has already happened — so two `!new` commands that read the same generation advance the
   conversation once, while two issued in sequence advance it twice, which is what each
   pair of users meant. Retrying would advance a second time and leave an orphan coordinate
   nobody ever posts into.
@@ -223,16 +206,18 @@ never consults the sessions table. That is also what keeps the coordinate resolv
 ### 3.4 Decided semantics
 
 - **Every admitted message joins the current coordinate**, top-level or in a thread. A
-  conversation in `append` has exactly one live session per agent.
+  conversation in `append` has one current reservation per agent; retired generations
+  can still drain already admitted work after a reset.
 - **Answers post where the message came from.** The delivery coordinate is untouched, so
   an in-thread question is answered in that thread and a top-level one is answered the way
   that platform already answers one, including Discord's `materializeRootThread`. The
   visible conversation shape does not change; only which session remembers it does.
 - **Mode is read per message.** Flipping the setting migrates nothing. Sessions from the
   `createNew` era live at ordinary thread coordinates, which are not append coordinates,
-  so they are simply not candidates for the maximum — the first message after the flip
-  mints a fresh coordinate rather than adopting whichever thread happened to be touched
-  last.
+  so the first-ever transition to append reserves a fresh coordinate rather than adopting
+  whichever physical thread happened to be touched last. Switching back to append resumes its retained reservation, or creates a new one
+  if retention cleared it. The UI explains this; use `!new` for a fresh generation.
+  Already admitted messages keep their original coordinate across either transition.
 - **The coordinate is per agent.** Two agents in one `append` channel keep separate
   sessions and separate coordinates, so `!new` addressed to one does not disturb the
   other. Every other command in the vocabulary resolves a target agent and acts on that
@@ -258,10 +243,12 @@ with `ChannelSessionMode = z.enum(['createNew', 'append'])`.
   field populated unconditionally — like `mutedChannels`, which ships for the same reason.
 - **Sparse.** Only departures from the default are listed, so a large conversation list
   adds nothing to the common spec.
-- **Old daemons ignore it, by design.** `IntegrationCoreEnvelope` is a non-strict
-  `z.object`, so a daemon that predates the field strips it and keeps today's behavior,
-  which is exactly `createNew`. No capability advertisement and no daemon-side feature
-  flag: the default is inert, and the console offers the control unconditionally.
+- **Mixed versions fail closed.** Require `conversation-session-mode-v1` from every
+  eligible placement and affected shared-bot sibling before accepting append. Fence
+  register snapshots and live pushes too; never send append to an unsupported daemon.
+  The console uses the control plane's effective capability. Advertise support only after
+  the roadmap's C1–C6 release gates pass. Existing append configuration is retained when
+  support is unavailable; it is never silently downgraded.
 
 ## 5. Control plane
 
@@ -285,12 +272,15 @@ with `ChannelSessionMode = z.enum(['createNew', 'append'])`.
 
 ### 6.1 Resolving the coordinate
 
-`integrationCore()` returns the new `sessionModes` and `integrationRouting()` exposes a
-lookup. The per-target fan-out step resolves the coordinate for
+`integrationCore()` returns `sessionModes`; `integrationSessionMode()` exposes the
+canonical lookup independently of routing/trigger policy. The per-target fan-out step resolves the coordinate for
 `(agentId, msg, integrationId)` beside the `muteKey` and `activationKey` it already builds
 there — `createNew` yields today's value, `append` performs the atomic resolve-or-reserve
 of §3.3 — and puts it on the turn plan. Admission, the inbox lane, the observer, and
-`SessionManager.handle` all read that carried value.
+`SessionManager.handle` all read that carried value. `QueueEntry` carries the coordinates
+as trusted metadata, outside `NormalizedMessage`. Persist them in the durable inbox and
+restore them unchanged on replay, even after a reset or mode change. Legacy rows without
+coordinates preserve legacy per-thread identity; they do not join today's append reservation.
 
 ### 6.2 Transcript
 
@@ -300,8 +290,8 @@ coherent: the prompt path reads `(transcriptChannel, thread)`, and rows scattere
 the physical threads the conversation happens to use would be invisible to it.
 
 Because the coordinate is per agent, two agents in one `append` channel do not share
-transcript rows. Each still sees the whole conversation — including the other agent's
-posts — but as its own rows under its own coordinate. `recordObservedInbound()` currently
+transcript rows. Each sees authorized observed conversation events — including eligible peer posts —
+as its own rows under its own coordinate; append never expands observation permissions. `recordObservedInbound()` currently
 writes one row with a single owner (`recipient ?? inFlightAgent ?? initializingAgent`);
 for `append` conversations it writes one per agent holding a live append session there.
 
@@ -428,14 +418,18 @@ cursor to the moment it ran, so the replay window starts there and the session r
 from the `!new` point with nothing before it.
 
 The cleared session is the same session afterwards: same key, so the same
-`session_outward_ids` row and the same console entry. The clear leaves **no console
-trace** — a deliberate choice, not an oversight.
+`session_outward_ids` row and the same console entry. The clear records an audited reset boundary visible in the console timeline. It does not
+delete stored memory or cancel Standing Work; those have separate controls.
 
 ### 7.3 While a turn is in flight
 
 - **`append` allows it.** Minting a new coordinate does not touch the running turn: it
   finishes on the old coordinate and posts its answer to its own thread, while later
-  messages go to the new one. Refusing would be friction with nothing behind it.
+  messages go to the new one. Already queued messages also retain their old coordinate;
+  reply text must explain this. Old and new generations can overlap, so shared workspace
+  mutation still requires independent resource locking. Expose outstanding old runs by
+  identity so they remain cancellable. Deduplicate reset command events before CAS;
+  CAS coalesces only resets that observed the same generation, not every near-simultaneous command.
 - **`createNew` refuses it.** Clearing nulls the `acpSessionId` of the very row a running
   turn is identified by — the interrupt path resolves a turn through `rec.acpSessionId` —
   so it would pull the running turn's identity out from under it. `ctx.inflight` already
@@ -484,30 +478,13 @@ indistinguishable in a list.
 
 ## 9. Visibility and attribution
 
-Session visibility and ownership are computed once, at row insert, from the first
-milestone's sender and coordinates, and are never re-evaluated: `visibility`,
-`ownerIdentity`, and `visibilitySource` appear only in the `INSERT` list of the session
-metadata upsert, not in its `DO UPDATE SET` ("Visibility remains first-wins here").
-
-For the scope this design ships, **the default classification is safe**. `classifySession`
-marks an IM session `private` only when the conversation kind is `dm`, and `org`
-otherwise — so a channel's session is `org`-visible, readable by every org member, and
-`ownerIdentity` is provenance rather than a gate. Since §8 restricts the control to
-channel rows, an `append` session is never the single-owner `private` kind.
-
-One consequence still has to be closed: **an `append` session forbids `setVisibility`.**
-That route is gated on `ownerIdentity`, so in `createNew` the first sender can reclassify
-the thread they started — their own session. In `append` the same person owns the
-conversation's long-lived session, and flipping it to `private` would move every later
-participant's messages into a session only that person can read and only that person can
-continue from the console, with the privacy bit pushed to the daemon to exclude those
-turns from memory capture. An `append` session's audience follows its conversation, so it
-is not one person's to change.
-
-The eventual home for "audience = the conversation" is the existing external tier —
-`externalProvider` + `externalScopeId` bound to an `ExternalScope`, which nulls
-`ownerIdentity` and resolves membership live — but that tier only engages when an
-organization enables the provider policy, so it is not a prerequisite here.
+An append session's audience follows its authorized conversation policy, including private
+channels and membership changes. It is not owned by the first sender. An individual cannot
+privatize or broaden that shared session using `setVisibility`; enforce this server-side.
+Reuse existing audience policies for console reads, continuation, and memory capture. Do
+not assume every non-DM conversation is organization-public. If the installation cannot
+represent the required audience safely, append is unavailable for that conversation until
+that boundary is implemented. Retain each sender and source event as provenance.
 
 ## 10. A prerequisite fix
 
@@ -520,7 +497,9 @@ console open, with the rows of retired coordinates still on disk beside it. The 
 path is already bounded (`MAX_REPLAY_ENTRIES`, `MAX_CONTEXT_REFRESH_EVENTS`); this read is
 not.
 
-It is bounded as part of this work, not after it.
+Cursor pagination and bounded console rendering are release prerequisites. Prompt refresh
+also stays bounded. Transcript retention is a separate explicit policy. Protect admitted
+and running generations from session GC until they drain.
 
 ## 11. Testing
 
@@ -541,9 +520,9 @@ It is bounded as part of this work, not after it.
   transcript row uses; a clock moved backwards still mints above the current maximum.
 - `packages/daemon`, concurrency — two messages arriving together into a conversation with
   no append session resolve to ONE coordinate, enter one inbox lane, and claim one serial
-  gate; two simultaneous `!new` commands advance the conversation once and the CAS loser
+  gate; two `!new` commands reading the same generation advance it once and the CAS loser
   performs no second advance, while two sequential ones advance it twice; a `!new` racing
-  an in-flight message does not split the conversation across two coordinates. Run against
+  an in-flight message preserves the admitted coordinate while later admissions use the new one. Run against
   both store dialects, since the reservation's atomicity is what is under test.
 - `packages/daemon`, reservation lifetime — retention purging an append session clears the
   reservation naming it, so the next message mints fresh rather than inheriting the

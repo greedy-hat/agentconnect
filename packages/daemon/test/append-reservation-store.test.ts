@@ -83,6 +83,30 @@ describe('append reservation store', () => {
     }
   })
 
+  it('deduplicates a redelivered reset command after the reservation has advanced', async () => {
+    const [a, b] = await members()
+    try {
+      const initial = await a.resolveAppendReservation(AGENT, CHANNEL, 'bot-1', 1000)
+      const first = await a.advanceAppendReservation(AGENT, CHANNEL, 'bot-1', initial, 1001, 'slack:C1:reset-1')
+      expect(first).toEqual({ coordinate: 'append:1001', advanced: true })
+      // A retry resolves today's reservation first, but must still return the
+      // coordinate the original command minted rather than advance to 1002.
+      const replay = await b.advanceAppendReservation(
+        AGENT,
+        CHANNEL,
+        'bot-1',
+        await b.resolveAppendReservation(AGENT, CHANNEL, 'bot-1', 2000),
+        2000,
+        'slack:C1:reset-1'
+      )
+      expect(replay).toEqual({ coordinate: 'append:1001', advanced: false, duplicate: true })
+      expect(await a.resolveAppendReservation(AGENT, CHANNEL, 'bot-1', 2001)).toBe('append:1001')
+    } finally {
+      await a.close()
+      await b.close()
+    }
+  })
+
   it('clears only the reservation still naming a purged session and preserves the high-water mark', async () => {
     const [a, b] = await members()
     try {

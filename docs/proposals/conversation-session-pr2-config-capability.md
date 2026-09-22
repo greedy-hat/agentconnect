@@ -1,5 +1,10 @@
 # PR 2 — Conversation Session Mode Config + Capability Fence
 
+> Scope: this is an incremental implementation plan, not the full release boundary.
+> See the [complete roadmap](agentconnect-improvement-roadmap.md), especially packages
+> C1–C7. Physical participation, durable coordinate replay, reset/command UX, audience
+> enforcement, and bounded history must all pass before append capability is advertised.
+
 ## Goal
 
 Complete the configuration surface for conversation session mode and make mixed-version rollout safe, while still **not** activating append runtime behavior.
@@ -30,8 +35,7 @@ The daemon must not advertise append support until append runtime behavior is ac
 Define the feature constant now:
 
 ```ts
-export const CONVERSATION_SESSION_MODE_V1_FEATURE =
-  'conversation-session-mode-v1'
+export const CONVERSATION_SESSION_MODE_V1_FEATURE = 'conversation-session-mode-v1'
 ```
 
 but do **not** add it to `registrationFeatures()` in this PR.
@@ -119,14 +123,8 @@ packages/control-plane/src/domain/integration-features.ts
 Suggested functions:
 
 ```ts
-export function requiredIntegrationFeatures(
-  channels: readonly IntegrationChannelRecord[]
-): readonly string[] {
-  return channels.some(
-    (channel) => channel.sessionMode === 'append'
-  )
-    ? [CONVERSATION_SESSION_MODE_V1_FEATURE]
-    : []
+export function requiredIntegrationFeatures(channels: readonly IntegrationChannelRecord[]): readonly string[] {
+  return channels.some((channel) => channel.sessionMode === 'append') ? [CONVERSATION_SESSION_MODE_V1_FEATURE] : []
 }
 ```
 
@@ -205,20 +203,10 @@ packages/daemon/src/platforms/integration-config.ts
 Suggested:
 
 ```ts
-import type {
-  ChannelSessionMode
-} from '@agentconnect.md/protocol'
+import type { ChannelSessionMode } from '@agentconnect.md/protocol'
 
-export function integrationSessionMode(
-  int: Integration,
-  channel: string
-): ChannelSessionMode {
-  return (
-    integrationCore(int)
-      .sessionModes
-      .find((entry) => entry.channel === channel)
-      ?.mode ?? 'createNew'
-  )
+export function integrationSessionMode(int: Integration, channel: string): ChannelSessionMode {
+  return integrationCore(int).sessionModes.find((entry) => entry.channel === channel)?.mode ?? 'createNew'
 }
 ```
 
@@ -243,9 +231,7 @@ The control-plane DTO already carries `sessionMode`, but the web client's `Integ
 Add:
 
 ```ts
-export type ChannelSessionMode =
-  | 'createNew'
-  | 'append'
+export type ChannelSessionMode = 'createNew' | 'append'
 ```
 
 and:

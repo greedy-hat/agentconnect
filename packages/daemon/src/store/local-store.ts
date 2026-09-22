@@ -19,6 +19,7 @@ import {
 } from '@agentconnect.md/protocol'
 import type { NoteProjectionOutcome, NoteProjectionPhase, NoteProjectionRow } from '../gitlab/note-projection.js'
 import type { ReviewIntentRow } from '../gitlab/review-adapter.js'
+import { redactAuditDetails } from '../execution/governance.js'
 import { SESSION_TITLE_TOOL_TITLES } from '../mcp/session-title-tool.js'
 import type { ScheduleRun } from '../scheduler/scheduler.js'
 import { AsyncMutex } from './async-mutex.js'
@@ -568,6 +569,11 @@ export interface InboxRow {
   id: string
   sessionKey: string
   agentId: string
+  /** Trusted coordinates resolved when this delivery was admitted. They are
+   * deliberately separate from `msg`: provider input must never select the
+   * logical session used on crash replay. Null is the pre-coordinate shape. */
+  deliveryThread?: string | null
+  sessionThread?: string | null
   /** JSON.stringify(NormalizedMessage). */
   msg: string
   integrationId?: string | null
@@ -956,7 +962,7 @@ export const THREAD_PARTICIPATION_BACKFILL = `
  * fresh databases and every established one fails at query time. `SCHEMA_MIGRATIONS`
  * asserts the two stay in lockstep for exactly that reason.
  */
-const SCHEMA_VERSION = 22
+const SCHEMA_VERSION = 25
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -1152,7 +1158,50 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean }) => Promise<v
     // it STARTS the statement, so folding this into the CREATE would ship SQLite syntax.
     await db.exec(THREAD_PARTICIPATION_SCHEMA)
     await db.exec(THREAD_PARTICIPATION_BACKFILL)
-  }
+  },
+  // An admitted row must retain its resolved coordinates. Legacy nulls are
+  // deliberately replayed with the old per-thread interpretation.
+  async (db) => {
+    // Fixture and operator repairs can leave a database stamped with an older
+    // version while already carrying either column. Treat precisely that state
+    // as already migrated; do not mask any other schema failure.
+    for (const column of ['deliveryThread', 'sessionThread']) {
+      try {
+        await db.exec(`ALTER TABLE inbox ADD COLUMN ${column} TEXT`)
+      } catch (error) {
+        if (!/duplicate column|already exists/i.test(String(error))) throw error
+      }
+    }
+  },
+  // A provider may redeliver a command after its first acknowledgement was
+  // lost. Record the command event so that retry cannot advance another
+  // append generation.
+  async (db) =>
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS append_session_reset_command (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        commandId TEXT NOT NULL, coordinate TEXT NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope, commandId)
+      );
+    `),
+  async (db) =>
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS execution_quota_account (
+        orgId TEXT NOT NULL, scope TEXT NOT NULL, limitAmount INTEGER NOT NULL, reservedAmount INTEGER NOT NULL DEFAULT 0,
+        spentAmount INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER NOT NULL, PRIMARY KEY (orgId, scope)
+      );
+      CREATE TABLE IF NOT EXISTS execution_quota_reservation (
+        id TEXT PRIMARY KEY, orgId TEXT NOT NULL, scope TEXT NOT NULL, amount INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'settled', 'released')),
+        actualAmount INTEGER, createdAt INTEGER NOT NULL, settledAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS execution_quota_reservation_scope ON execution_quota_reservation (orgId, scope, status);
+      CREATE TABLE IF NOT EXISTS execution_audit_outbox (
+        eventId TEXT NOT NULL, orgId TEXT NOT NULL, event TEXT NOT NULL, createdAt INTEGER NOT NULL, acknowledgedAt INTEGER,
+        PRIMARY KEY (orgId, eventId)
+      );
+      CREATE INDEX IF NOT EXISTS execution_audit_outbox_pending ON execution_audit_outbox (orgId, acknowledgedAt, createdAt);
+    `)
 ]
 
 // The list and the version are two halves of one fact: step `i` moves a database from
@@ -1280,6 +1329,26 @@ export class LocalStore {
         maxMillis INTEGER NOT NULL,
         PRIMARY KEY (agentId, channel, transportScope)
       );
+      CREATE TABLE IF NOT EXISTS append_session_reset_command (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        commandId TEXT NOT NULL, coordinate TEXT NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope, commandId)
+      );
+      CREATE TABLE IF NOT EXISTS execution_quota_account (
+        orgId TEXT NOT NULL, scope TEXT NOT NULL, limitAmount INTEGER NOT NULL, reservedAmount INTEGER NOT NULL DEFAULT 0,
+        spentAmount INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER NOT NULL, PRIMARY KEY (orgId, scope)
+      );
+      CREATE TABLE IF NOT EXISTS execution_quota_reservation (
+        id TEXT PRIMARY KEY, orgId TEXT NOT NULL, scope TEXT NOT NULL, amount INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'settled', 'released')),
+        actualAmount INTEGER, createdAt INTEGER NOT NULL, settledAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS execution_quota_reservation_scope ON execution_quota_reservation (orgId, scope, status);
+      CREATE TABLE IF NOT EXISTS execution_audit_outbox (
+        eventId TEXT NOT NULL, orgId TEXT NOT NULL, event TEXT NOT NULL, createdAt INTEGER NOT NULL, acknowledgedAt INTEGER,
+        PRIMARY KEY (orgId, eventId)
+      );
+      CREATE INDEX IF NOT EXISTS execution_audit_outbox_pending ON execution_audit_outbox (orgId, acknowledgedAt, createdAt);
       -- A !stop can arrive while a cold session is still materializing, before the
       -- sessions row exists. Keep the mute independently keyed so that stop survives a
       -- daemon restart and is applied when the session row is eventually created.
@@ -1495,6 +1564,8 @@ export class LocalStore {
         id TEXT PRIMARY KEY,
         sessionKey TEXT NOT NULL,
         agentId TEXT NOT NULL,
+        deliveryThread TEXT,
+        sessionThread TEXT,
         msg TEXT NOT NULL,
         integrationId TEXT,
         callMeta TEXT,
@@ -1950,17 +2021,39 @@ export class LocalStore {
     channel: string,
     transportScope: string,
     expected: string,
-    now = Date.now()
-  ): Promise<{ coordinate: string; advanced: boolean } | undefined> {
+    now = Date.now(),
+    commandId?: string
+  ): Promise<{ coordinate: string; advanced: boolean; duplicate?: boolean } | undefined> {
     return this.transaction(async (raw) => {
       const tx = accessOf(raw)
+      if (commandId) {
+        const prior = (await tx
+          .prepare(
+            `SELECT coordinate FROM append_session_reset_command
+             WHERE agentId = ? AND channel = ? AND transportScope = ? AND commandId = ?`
+          )
+          .get(agentId, channel, transportScope, commandId)) as { coordinate: string } | undefined
+        if (prior) return { coordinate: prior.coordinate, advanced: false, duplicate: true }
+      }
+      const remember = async (coordinate: string): Promise<void> => {
+        if (!commandId) return
+        await tx
+          .prepare(
+            `INSERT OR IGNORE INTO append_session_reset_command
+             (agentId, channel, transportScope, commandId, coordinate) VALUES (?, ?, ?, ?, ?)`
+          )
+          .run(agentId, channel, transportScope, commandId, coordinate)
+      }
       const current = (await tx
         .prepare(
           'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
         )
         .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
       if (!current) return undefined
-      if (current.coordinate !== expected) return { coordinate: current.coordinate, advanced: false }
+      if (current.coordinate !== expected) {
+        await remember(current.coordinate)
+        return { coordinate: current.coordinate, advanced: false }
+      }
       const previous = (await tx
         .prepare('SELECT maxMillis FROM append_session_clock WHERE agentId = ? AND channel = ? AND transportScope = ?')
         .get(agentId, channel, transportScope)) as { maxMillis: number } | undefined
@@ -1978,7 +2071,9 @@ export class LocalStore {
             'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
           )
           .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
-        return winner ? { coordinate: winner.coordinate, advanced: false } : undefined
+        if (!winner) return undefined
+        await remember(winner.coordinate)
+        return { coordinate: winner.coordinate, advanced: false }
       }
       await tx
         .prepare(
@@ -1987,8 +2082,123 @@ export class LocalStore {
            ON CONFLICT (agentId, channel, transportScope) DO UPDATE SET maxMillis = excluded.maxMillis`
         )
         .run(agentId, channel, transportScope, millis)
+      await remember(coordinate)
       return { coordinate, advanced: true }
     })
+  }
+
+  /** Atomically reserve a bounded allowance. Reusing an id is idempotent; a different policy cap fails closed. */
+  async reserveExecutionQuota(
+    id: string,
+    orgId: string,
+    scope: string,
+    amount: number,
+    limitAmount: number,
+    now = Date.now()
+  ): Promise<'reserved' | 'denied' | 'conflict'> {
+    if (
+      !id ||
+      !orgId ||
+      !scope ||
+      !Number.isSafeInteger(amount) ||
+      amount < 0 ||
+      !Number.isSafeInteger(limitAmount) ||
+      limitAmount < 0
+    )
+      throw new Error('invalid execution quota reservation')
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const prior = (await tx
+        .prepare('SELECT orgId, scope, amount FROM execution_quota_reservation WHERE id = ?')
+        .get(id)) as { orgId: string; scope: string; amount: number } | undefined
+      if (prior)
+        return prior.orgId === orgId && prior.scope === scope && Number(prior.amount) === amount
+          ? 'reserved'
+          : 'conflict'
+      await tx
+        .prepare(
+          `INSERT INTO execution_quota_account (orgId, scope, limitAmount, reservedAmount, spentAmount, updatedAt) VALUES (?, ?, ?, 0, 0, ?) ON CONFLICT (orgId, scope) DO NOTHING`
+        )
+        .run(orgId, scope, limitAmount, now)
+      const claimed = await tx
+        .prepare(
+          `UPDATE execution_quota_account SET reservedAmount = reservedAmount + ?, updatedAt = ? WHERE orgId = ? AND scope = ? AND limitAmount = ? AND reservedAmount + spentAmount + ? <= limitAmount`
+        )
+        .run(amount, now, orgId, scope, limitAmount, amount)
+      if (Number(claimed.changes) === 0) return 'denied'
+      await tx
+        .prepare(
+          `INSERT INTO execution_quota_reservation (id, orgId, scope, amount, status, createdAt) VALUES (?, ?, ?, ?, 'reserved', ?)`
+        )
+        .run(id, orgId, scope, amount, now)
+      return 'reserved'
+    })
+  }
+
+  /** Settle once; uncertain reservations deliberately remain reserved for reconciliation. */
+  async settleExecutionQuota(id: string, actualAmount: number, now = Date.now()): Promise<boolean> {
+    if (!Number.isSafeInteger(actualAmount) || actualAmount < 0) throw new Error('invalid execution quota settlement')
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const row = (await tx
+        .prepare('SELECT orgId, scope, amount, status FROM execution_quota_reservation WHERE id = ?')
+        .get(id)) as { orgId: string; scope: string; amount: number; status: string } | undefined
+      if (!row) return false
+      if (row.status !== 'reserved') return row.status === 'settled'
+      const actual = Math.min(actualAmount, Number(row.amount))
+      const changed = await tx
+        .prepare(
+          `UPDATE execution_quota_reservation SET status = 'settled', actualAmount = ?, settledAt = ? WHERE id = ? AND status = 'reserved'`
+        )
+        .run(actual, now, id)
+      if (Number(changed.changes) === 0) return false
+      await tx
+        .prepare(
+          `UPDATE execution_quota_account SET reservedAmount = reservedAmount - ?, spentAmount = spentAmount + ?, updatedAt = ? WHERE orgId = ? AND scope = ?`
+        )
+        .run(row.amount, actual, now, row.orgId, row.scope)
+      return true
+    })
+  }
+
+  /** Insert audit intent before an effect; event ids make retries safe. */
+  async appendExecutionAudit(eventId: string, orgId: string, event: unknown, now = Date.now()): Promise<boolean> {
+    if (!eventId || !orgId) throw new Error('execution audit event id and org id are required')
+    const safeEvent =
+      event && typeof event === 'object' && !Array.isArray(event)
+        ? {
+            ...(event as Record<string, unknown>),
+            details: redactAuditDetails((event as { details?: Record<string, unknown> }).details)
+          }
+        : event
+    const result = await this.db
+      .prepare(
+        `INSERT INTO execution_audit_outbox (eventId, orgId, event, createdAt) VALUES (?, ?, ?, ?) ON CONFLICT (orgId, eventId) DO NOTHING`
+      )
+      .run(eventId, orgId, JSON.stringify(safeEvent), now)
+    return Number(result.changes) > 0
+  }
+
+  async pendingExecutionAudit(
+    orgId: string,
+    limit: number
+  ): Promise<Array<{ eventId: string; event: unknown; createdAt: number }>> {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('execution audit limit must be positive')
+    const rows = (await this.db
+      .prepare(
+        `SELECT eventId, event, createdAt FROM execution_audit_outbox WHERE orgId = ? AND acknowledgedAt IS NULL ORDER BY createdAt, eventId LIMIT ?`
+      )
+      .all(orgId, limit)) as Array<{ eventId: string; event: string; createdAt: number }>
+    return rows.map((row) => ({ eventId: row.eventId, event: JSON.parse(row.event), createdAt: Number(row.createdAt) }))
+  }
+
+  async acknowledgeExecutionAudit(eventId: string, orgId: string, now = Date.now()): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        'UPDATE execution_audit_outbox SET acknowledgedAt = ? WHERE eventId = ? AND orgId = ? AND acknowledgedAt IS NULL'
+      )
+      .run(now, eventId, orgId)
+    return Number(result.changes) > 0
   }
 
   async getSession(key: string): Promise<SessionRecord | undefined> {
@@ -2753,18 +2963,20 @@ export class LocalStore {
         needsParentReply: rec.needsParentReply === 1 ? 1 : null,
         platformStanding: rec.platformStanding ?? null
       })
-    // The session's coordinate IS its physical thread today, so recording affinity from the
-    // row just written is equivalent to the `sessions` lookup this replaces, for every writer.
-    // Not in one transaction with it: this is the hot path, and a failure between the two
-    // costs an unmentioned follow-up its routing only until the next upsert repairs it.
-    await this.recordThreadParticipation({
-      channel: rec.channel,
-      thread: rec.thread,
-      agentId: rec.agentId,
-      sessionKey: rec.key,
-      transportScope: rec.transportScope ?? null,
-      updatedAt: rec.updatedAt
-    })
+    // Per-thread sessions still have one coordinate for both roles. An append
+    // coordinate is logical only, however, and must never become a provider
+    // thread-affinity record; the daemon records its actual physical delivery
+    // thread after admission/turn creation instead.
+    if (!rec.thread.startsWith('append:')) {
+      await this.recordThreadParticipation({
+        channel: rec.channel,
+        thread: rec.thread,
+        agentId: rec.agentId,
+        sessionKey: rec.key,
+        transportScope: rec.transportScope ?? null,
+        updatedAt: rec.updatedAt
+      })
+    }
   }
 
   /** Note that an agent is active in a PHYSICAL thread (channel-session-mode.md §6.4). */
@@ -5067,6 +5279,27 @@ export class LocalStore {
     return await this.threadAgentsByState(channel, thread, transportScope, 'open')
   }
 
+  /** Live logical sessions that have participated in one PHYSICAL thread. This is
+   * the bridge for an unrouted observation: append sessions are keyed by a
+   * synthetic coordinate, so their transcript must not fall back to this physical
+   * thread just because routing did not select a recipient. */
+  async activeThreadParticipations(
+    channel: string,
+    thread: string,
+    transportScope?: string | null
+  ): Promise<Array<{ agentId: string; sessionThread: string }>> {
+    return (await this.db
+      .prepare(
+        `SELECT DISTINCT p.agentId AS agentId, s.thread AS sessionThread
+         FROM thread_participation p
+         JOIN sessions s ON s.key = p.sessionKey
+           AND COALESCE(s.transportScope, '') = p.transportScope
+           AND s.agentId = p.agentId
+         WHERE p.channel = ? AND p.thread = ? AND p.transportScope = ? AND s.state != 'closed'`
+      )
+      .all(channel, thread, transportScope ?? '')) as Array<{ agentId: string; sessionThread: string }>
+  }
+
   /**
    * Agents participating in a PHYSICAL thread, split by whether their session is live.
    *
@@ -5445,16 +5678,18 @@ export class LocalStore {
     const inserted = await this.db
       .prepare(
         `INSERT OR IGNORE INTO inbox
-          (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, posterPublishState,
+          (id, sessionKey, agentId, deliveryThread, sessionThread, msg, integrationId, callMeta, hookContext, posterPublishState,
             terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
          VALUES
-           (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
+           (@id, @sessionKey, @agentId, @deliveryThread, @sessionThread, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
             @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
       )
       .run({
         id: row.id,
         sessionKey: row.sessionKey,
         agentId: row.agentId,
+        deliveryThread: row.deliveryThread ?? null,
+        sessionThread: row.sessionThread ?? null,
         msg: row.msg,
         integrationId: row.integrationId ?? null,
         callMeta: row.callMeta ?? null,
@@ -5497,16 +5732,18 @@ export class LocalStore {
         tx
           .prepare(
             `INSERT OR IGNORE INTO inbox
-              (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, posterPublishState,
+              (id, sessionKey, agentId, deliveryThread, sessionThread, msg, integrationId, callMeta, hookContext, posterPublishState,
                 terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
              VALUES
-               (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
+               (@id, @sessionKey, @agentId, @deliveryThread, @sessionThread, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
                 @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
           )
           .run({
             id: r.id,
             sessionKey: r.sessionKey,
             agentId: r.agentId,
+            deliveryThread: r.deliveryThread ?? null,
+            sessionThread: r.sessionThread ?? null,
             msg: r.msg,
             integrationId: r.integrationId ?? null,
             callMeta: r.callMeta ?? null,

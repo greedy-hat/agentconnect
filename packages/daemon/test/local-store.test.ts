@@ -98,7 +98,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     const upgraded = await LocalStore.open(path)
     expect(await upgraded.resolveAppendReservation('a', 'C1', 'bot', 1000)).toBe('append:1000')
     await upgraded.close()
-    expect(userVersion(path)).toBe(22)
+    expect(userVersion(path)).toBe(25)
   })
 
   it('stamps a freshly created store with the current schema version', async () => {
@@ -172,12 +172,14 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     // Recovery ownership: a pool member must be able to tell its own rows from a peer's.
     expect(dreamColumns).toContain('ownerId')
     expect(grantColumns).toContain('ownerId')
-    expect(inboxColumns).toEqual(expect.arrayContaining(['reportOwnerId', 'reportClaimedAt']))
+    expect(inboxColumns).toEqual(
+      expect.arrayContaining(['reportOwnerId', 'reportClaimedAt', 'deliveryThread', 'sessionThread'])
+    )
     // A stamp is only comparable to a fire of the same schedule definition (#1031).
     expect(cronColumns).toContain('definition')
     // Purge receipts are leased per pool member (#1032).
     expect(purgeColumns).toEqual(expect.arrayContaining(['ownerId', 'claimedAt']))
-    expect(userVersion(path)).toBe(22)
+    expect(userVersion(path)).toBe(25)
   })
 
   it.skipIf(pg)('never persists the CP routing map on a shared store, and still does on an owned one', async () => {
@@ -244,7 +246,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     expect(await upgraded.isCaptureExcluded('bot-c', 'c')).toBe(true)
     await upgraded.close()
 
-    expect(userVersion(path)).toBe(22)
+    expect(userVersion(path)).toBe(25)
   })
 
   it('re-keys the runtime catalog cache on its owning member when upgrading a v7 store', async () => {
@@ -300,7 +302,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
         .map((column) => column.name)
     expect(primaryKey(metaColumns)).toEqual(['ownerId', 'runtimeId'])
     expect(primaryKey(capColumns)).toEqual(['ownerId', 'runtimeId', 'modelId'])
-    expect(userVersion(path)).toBe(22)
+    expect(userVersion(path)).toBe(25)
   })
 
   it('backfills a v11 store with the outward id its sessions were already reported under', async () => {
@@ -328,7 +330,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     expect((await upgraded.getSession('k2'))?.sessionId).toBeNull()
     expect(await upgraded.ensureOutwardSessionId('k2', 'bot-a')).toMatch(/^[0-9a-f-]{36}$/)
     await upgraded.close()
-    expect(userVersion(path)).toBe(22)
+    expect(userVersion(path)).toBe(25)
   })
 
   // The regression that made `directDestination` reachable on fresh databases only: the step was
@@ -354,7 +356,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     await upgraded.setSessionClassification('k1', { sourceBindingKind: 'external', directDestination: true })
     expect(await upgraded.getSessionClassification('bot-a', 'acp-1')).toMatchObject({ directDestination: true })
     await upgraded.close()
-    expect(userVersion(path)).toBe(22)
+    expect(userVersion(path)).toBe(25)
   })
 
   it('refuses a store written by a newer daemon WITHOUT touching it first', async () => {
@@ -1647,6 +1649,43 @@ describe('LocalStore session retention GC (#485)', () => {
     await s.close()
   })
 
+  it('persists admission-time coordinates without allowing a duplicate to replace them', async () => {
+    const s = await store()
+    await s.appendInbox({
+      id: 'append-delivery',
+      sessionKey: 'slack:C1:append:100:bot-a',
+      agentId: 'bot-a',
+      deliveryThread: '1710000000.000001',
+      sessionThread: 'append:100',
+      msg: '{}',
+      enqueuedAt: '0000000001'
+    })
+    // A provider retry must retain the original admitted coordinate even if its
+    // caller has subsequently resolved a newer append reservation.
+    await s.appendInbox({
+      id: 'append-delivery',
+      sessionKey: 'slack:C1:append:200:bot-a',
+      agentId: 'bot-a',
+      deliveryThread: '1710000000.000001',
+      sessionThread: 'append:200',
+      msg: '{"retry":true}',
+      enqueuedAt: '0000000002'
+    })
+    await s.appendInbox({ id: 'legacy-delivery', sessionKey: 'legacy', agentId: 'bot-a', msg: '{}', enqueuedAt: '2' })
+
+    const rows = await s.listInboxBySessionKeyFifo()
+    expect(rows.find((row) => row.id === 'append-delivery')).toMatchObject({
+      deliveryThread: '1710000000.000001',
+      sessionThread: 'append:100',
+      msg: '{}'
+    })
+    expect(rows.find((row) => row.id === 'legacy-delivery')).toMatchObject({
+      deliveryThread: null,
+      sessionThread: null
+    })
+    await s.close()
+  })
+
   it('deleteSession removes the row and its mute/inbox/gate/permission cascades, keeping transcripts', async () => {
     const s = await store()
     await seed(s, 'gone', 'closed', 100)
@@ -2918,6 +2957,37 @@ it.skipIf(pg)('reads thread affinity from the participation record, and drops it
   await s.close()
 })
 
+it.skipIf(pg)('keeps append session coordinates out of physical thread affinity', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-append-affinity-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const key = sessionKey('slack', 'C1', 'append:100', 'bot-a')
+  await s.upsertSession({
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: 'append:100',
+    acpSessionId: 'acp-1',
+    state: 'idle',
+    lastDeliveredTs: null,
+    updatedAt: 1
+  })
+
+  expect(await s.openSessionAgents('C1', 'append:100')).toEqual([])
+  await s.recordThreadParticipation({
+    channel: 'C1',
+    thread: '1710000000.000001',
+    agentId: 'bot-a',
+    sessionKey: key,
+    updatedAt: 2
+  })
+  expect(await s.openSessionAgents('C1', '1710000000.000001')).toEqual(['bot-a'])
+  expect(await s.activeThreadParticipations('C1', '1710000000.000001')).toEqual([
+    { agentId: 'bot-a', sessionThread: 'append:100' }
+  ])
+  await s.close()
+})
+
 it.skipIf(pg)('upgrades a v17 store to durable memory continuations without changing existing sessions', async () => {
   const path = join(mkdtempSync(join(tmpdir(), 'ac-memory-migration-')), 'local.sqlite')
   const initial = await openTestStore(path)
@@ -2932,6 +3002,6 @@ it.skipIf(pg)('upgrades a v17 store to durable memory continuations without chan
   expect(await upgraded.getMemoryEntryContinuation('bot-a', token, 999)).toBe('{"page":2}')
   await upgraded.close()
   const check = new DatabaseSync(path)
-  expect(check.prepare('PRAGMA user_version').get()).toEqual({ user_version: 22 })
+  expect(check.prepare('PRAGMA user_version').get()).toEqual({ user_version: 25 })
   check.close()
 })

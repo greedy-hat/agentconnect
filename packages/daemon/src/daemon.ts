@@ -4,6 +4,7 @@ import {
   MEMORY_ENTRIES_SEARCH_V1_FEATURE,
   MEMORY_ENTRIES_HISTORY_V1_FEATURE,
   MEMORY_ENTRIES_WRITE_V1_FEATURE,
+  CONVERSATION_SESSION_MODE_V1_FEATURE,
   AgentActivate as AgentActivateSchema,
   AgentSkillEntry as AgentSkillEntrySchema,
   WEBCHAT_MULTI_AGENT_FEATURE,
@@ -5451,6 +5452,9 @@ export class Daemon {
       ...(this.dreamOperationsAllowed() ? [ORGANIZATION_SUGGESTION_REVIEW_FEATURE] : []),
       SESSION_VISIBILITY_FEATURE,
       SLACK_SESSION_AUDIENCE_FEATURE,
+      // Append-mode coordinate admission, durable replay, reset CAS, and physical
+      // thread affinity are all daemon-owned and present in this release.
+      CONVERSATION_SESSION_MODE_V1_FEATURE,
       // This daemon persists the greatest applied AgentSpec.configRevision and
       // refuses an older or contradicting snapshot (organization-secrets-and-
       // variables.md §7). The CP gates placement of an agent bound to an
@@ -9252,7 +9256,39 @@ export class Daemon {
   private async recordUnrouted(msg: NormalizedMessage): Promise<void> {
     // Preserve the established default transcript shape until the rollout flag is
     // enabled; the new observer folds attachment mentions into context prompts.
-    await this.recordObservedInbound(msg, undefined, this.cfg.features.turnFinalContextRefresh)
+    const physical = currentSessionCoordinates(msg)
+    const participants = await this.store.activeThreadParticipations(
+      msg.channel,
+      physical.deliveryThread,
+      msg.transportScope
+    )
+    // A cold first turn has passed admission but may not have written its session
+    // row yet. Its gate entry is authoritative for the same short interval, and
+    // lets an unrouted clarification join the correct append transcript while
+    // the runtime is still starting.
+    const active = [...this.activeGateEntries.values()]
+      .filter(
+        (entry) =>
+          entry.msg.channel === msg.channel &&
+          entry.msg.transportScope === msg.transportScope &&
+          entry.coordinates.deliveryThread === physical.deliveryThread
+      )
+      .map((entry) => ({ agentId: entry.agentId, sessionThread: entry.coordinates.sessionThread }))
+    const bySession = new Map<string, { agentId: string; sessionThread: string }>()
+    for (const participant of [...participants, ...active])
+      bySession.set(`${participant.agentId}\u0000${participant.sessionThread}`, participant)
+    if (bySession.size === 0) {
+      await this.recordObservedInbound(msg, undefined, this.cfg.features.turnFinalContextRefresh)
+      return
+    }
+    // A physical reply thread may feed several agents, each with its own append
+    // coordinate. Record one audience-scoped observation per logical session;
+    // do not let an unrouted event select or expose another agent's transcript.
+    for (const participant of bySession.values()) {
+      await this.recordObservedInbound(msg, participant.agentId, this.cfg.features.turnFinalContextRefresh, {
+        sessionThread: participant.sessionThread
+      })
+    }
   }
 
   /** Persist one conversational ingress for a live physical thread before routing
@@ -10399,6 +10435,8 @@ export class Daemon {
       id,
       sessionKey: key,
       agentId: entry.agentId,
+      deliveryThread: entry.coordinates.deliveryThread,
+      sessionThread: entry.coordinates.sessionThread,
       msg: JSON.stringify(entry.msg),
       integrationId: entry.integrationId ?? null,
       callMeta: entry.callMeta ? JSON.stringify(entry.callMeta) : null,
@@ -12153,6 +12191,18 @@ export class Daemon {
       }
       // §2.3/§5.3: hand the origin session id to prompt assembly so a child woken by another
       // session's `sendMessage` gets its `Parent session` line (the SessionTarget to reply into).
+      // Write the physical affinity before the runtime can spend a long time in
+      // its first prompt. The session row may be created moments later by
+      // `handle`; until then LocalStore's join intentionally keeps this record
+      // invisible, and a failed initialization leaves no routable stale owner.
+      await this.store.recordThreadParticipation({
+        channel: msg.channel,
+        thread: entry.coordinates.deliveryThread,
+        agentId,
+        sessionKey: key,
+        transportScope: msg.transportScope,
+        updatedAt: this.clock.now()
+      })
       handled = await this.sessions.handle(
         agentId,
         msg,
@@ -14230,6 +14280,7 @@ export class Daemon {
       turnState<SlackTurnState>(p),
       action
     )
+    await this.recordOutboundParticipation(p)
   }
 
   /**
@@ -14255,6 +14306,7 @@ export class Daemon {
       turnState<TelegramTurnState>(p),
       action
     )
+    await this.recordOutboundParticipation(p)
   }
 
   /**
@@ -14279,6 +14331,7 @@ export class Daemon {
       p,
       action
     )
+    await this.recordOutboundParticipation(p)
   }
 
   /** Apply one Feishu action. Agent body delivery is one CardKit entity for the whole
@@ -14299,6 +14352,23 @@ export class Daemon {
       turnState<FeishuTurnState>(p),
       action
     )
+    await this.recordOutboundParticipation(p)
+  }
+
+  /** A successful platform action proves that this agent participates in the
+   * physical destination. Keep this independent of the logical append session
+   * coordinate, which is never a provider thread identifier. */
+  private async recordOutboundParticipation(p: Pending): Promise<void> {
+    const thread = p.plan.statusThread
+    if (!thread) return
+    await this.store.recordThreadParticipation({
+      channel: p.plan.channel,
+      thread,
+      agentId: p.plan.agentId,
+      sessionKey: p.plan.sessionKey,
+      transportScope: p.plan.transportScope,
+      updatedAt: this.clock.now()
+    })
   }
 
   /** Web App console base URL the CP sent on `auth/ok` (its own console origin). A local
@@ -19107,6 +19177,12 @@ export class Daemon {
           ...(row.isQueueCmd ? { isQueueCmd: true } : {}),
           fromInboxReplay: true,
           inboxReplayId: row.id,
+          // Never re-resolve a persisted append delivery against the current
+          // reservation/mode. Rows written before this field existed preserve
+          // their historical per-thread behaviour.
+          ...(row.deliveryThread && row.sessionThread
+            ? { coordinates: { deliveryThread: row.deliveryThread, sessionThread: row.sessionThread } }
+            : {}),
           // Marker 0 is a pre-loop-guard admission (including rows retained while the
           // agent lived on another daemon). Charge it once; persistInbox advances it to
           // 1 after successful admission. Current-version rows remain replay-neutral.

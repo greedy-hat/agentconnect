@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { NormalizedMessage } from '../src/messages/normalized.js'
-import { currentSessionCoordinates, sessionKeyForCoordinates } from '../src/session/session-coordinate.js'
+import {
+  currentSessionCoordinates,
+  resolveSessionCoordinates,
+  sessionKeyForCoordinates
+} from '../src/session/session-coordinate.js'
 import { transcriptCoords } from '../src/session/session-manager.js'
 
 const message = (thread?: string): NormalizedMessage => ({
@@ -33,5 +37,32 @@ describe('session coordinates', () => {
     const coordinates = { deliveryThread: 'physical', sessionThread: 'logical' }
     expect(sessionKeyForCoordinates('agent-a', inbound, coordinates)).toBe('slack:C1:logical:agent-a')
     expect(transcriptCoords(inbound, coordinates)).toEqual({ thread: 'logical', ts: '100.2' })
+  })
+
+  it('keeps provider delivery physical while append resolves one logical lane per agent and transport', async () => {
+    const reservations = new Map<string, string>()
+    const store = {
+      resolveAppendReservation: async (agentId: string, channel: string, transportScope: string) => {
+        const key = `${agentId}:${channel}:${transportScope}`
+        const existing = reservations.get(key)
+        if (existing) return existing
+        const coordinate = `append:${reservations.size + 1}`
+        reservations.set(key, coordinate)
+        return coordinate
+      }
+    }
+    const root = { ...message(), transportScope: 'bot-a' }
+    const reply = { ...message('physical-thread'), transportScope: 'bot-a' }
+    await expect(resolveSessionCoordinates(store, 'agent-a', root, 'append')).resolves.toEqual({
+      deliveryThread: 'slack:C1:100.2',
+      sessionThread: 'append:1'
+    })
+    await expect(resolveSessionCoordinates(store, 'agent-a', reply, 'append')).resolves.toEqual({
+      deliveryThread: 'physical-thread',
+      sessionThread: 'append:1'
+    })
+    await expect(resolveSessionCoordinates(store, 'agent-b', root, 'append')).resolves.toMatchObject({
+      sessionThread: 'append:2'
+    })
   })
 })

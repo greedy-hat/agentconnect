@@ -1,25 +1,80 @@
 # AgentConnect Improvement Roadmap
 
-This proposal focuses on two product gaps that would materially improve AgentConnect as a long-running team agent platform:
+> Status: proposed target architecture; delivered incrementally. Existing code implements
+> parts of the foundations, not every acceptance criterion below. This document defines
+> the cross-feature contracts and release gates. The linked PR plans define smaller changes.
 
-1. **Conversation-native persistent sessions**
-2. **Ambient / standing work**
+## 1. Product goals and delivery strategy
 
-The implementation strategy deliberately reuses AgentConnect's existing strengths: daemon-owned sessions, durable inboxes, serial admission, scheduler infrastructure, proactive messaging, memory, duty placement, and self-hosted execution.
+The complete roadmap has eight product tracks, in this priority order:
 
-## 1. Persistent conversation sessions
+1. **Conversation-native persistent sessions**: make channel/thread continuity a supported product.
+2. **Ambient / standing work**: durable objectives built on auto, cron, and webhook primitives.
+3. **Agent Identity v1**: organization-owned principals, initially GitHub App and service accounts.
+4. **Unified Audit**: provenance from task admission through tools, network access, and external effects.
+5. **Budgets & quotas**: Org → Agent → Conversation / Schedule / Standing Work, with hard caps and alerts.
+6. **Memory scopes + provenance**: conversation, workspace, and organization memory with administrative controls.
+7. **Sandbox hardening**: close production blockers and enforce execution and credential boundaries.
+8. **ACP v2 convergence**: use negotiated standard runtime capabilities and reduce proprietary remote protocol.
 
-### Goal
+This is product priority, not an instruction to defer all safety and reliability work until
+its numbered track. Minimal identity, audit, budget, audience, and sandbox contracts are
+prerequisites for releasing autonomous work. Their full management products can follow.
+Production-blocking sandbox issues are release blockers from the beginning. References
+such as #2176, #1874, and #2013 are motivation, not evidence that an issue is still open;
+verify their current status when planning an implementation or release.
 
-Allow a team conversation to continue one long-lived agent session across multiple physical threads while still delivering each reply and status update to the physical thread where the user asked.
+Reuse daemon-owned execution, durable inboxes, serial admission, scheduler infrastructure,
+proactive messaging, memory, duty placement, and self-hosted execution. Each release must
+work independently; do not require all eight tracks to ship before delivering sessions.
 
-The core invariant is:
+## 2. Shared contracts
 
-> **Physical delivery thread is not the same thing as logical session identity.**
+### Identity and provenance
 
-Today, `msg.thread` effectively participates in both. The design should split them explicitly.
+Use stable identifiers for organization, agent, execution principal, conversation, session,
+work definition, run, tool call, and external effect. Distinguish the requesting human,
+the organization principal executing the work, and the credential used at the provider.
+Never treat an agent display name or the first conversation sender as authorization.
 
-Recommended internal shape:
+Every admitted run carries trusted context equivalent to:
+
+```text
+orgId, agentId, principalId
+conversationRef?, sessionId, workId?, runId
+actorId?, authorizationRevision, definitionVersion?
+traceId, parentEventId?, budgetReservationId?, executionEpoch
+```
+
+A conversation reference includes provider/platform, integration or physical transport
+scope, and channel; a delivery destination additionally includes the physical thread.
+Neither a logical session id nor a user-supplied tool argument grants destination access.
+All persistence keys must be isolated by organization and provider/transport namespace,
+whether explicitly in columns or through an established scoped store/key encoding.
+
+### Authority and lifecycle
+
+The control plane owns definitions, principals, policy revisions, grants, and desired
+lifecycle state. Daemons own execution under a valid serving placement and execution
+lease. Completion is a durable, idempotent event reconciled to the control plane; an old
+run cannot reactivate or complete a newly edited definition.
+
+Authorization is checked at creation, run admission, and before an external effect.
+Permission revocation, pause, cancellation, expiration, and definition changes invalidate
+old execution authority. Provider operations already accepted cannot be recalled; audit
+such races. No new operation may be authorized using a stale revision once invalidated.
+For disconnected operation, bounded leases define the maximum revocation delay. When a
+lease expires or authority cannot be established, defer effects and new autonomous runs.
+
+### Rollout
+
+Feature-gate each new wire behavior. Check all eligible placements and shared-bot siblings,
+and fence both register snapshots and live pushes. Unsupported or unknown capability
+fails closed. Do not silently reinterpret a configured feature as legacy behavior.
+
+## 3. Conversation-native persistent sessions
+
+### Coordinates and defaults
 
 ```ts
 interface SessionCoordinates {
@@ -28,404 +83,443 @@ interface SessionCoordinates {
 }
 ```
 
-For the existing behavior:
+`createNew` preserves today's physical-thread session identity. `append` resolves one
+logical `append:<monotonic timestamp>` coordinate per agent and conversation while each
+reply/status goes to the physical thread that triggered it. Trigger policy
+`off | mention | any` remains independent of session policy `createNew | append`.
+
+Keep **Per thread** as the default, including Slack. **Continuous** is opt-in for dedicated
+project or operations channels. One continuous session has one serial queue, so unrelated
+threads share context and may wait behind a long turn. Explain this in the control's help
+and show queue state. Do not expose the control for DMs/group DMs in the first release.
+Topic classification or automatic session selection is a separate later design.
+
+### Reservation and admission
+
+The durable reservation is keyed by `(agentId, channel, transportScope)` within the store's
+organization/provider namespace. Resolve atomically with insert-if-absent then read the
+winner. Mint using `max(now, previousMax + 1)` with a persisted high-water mark that survives
+session and reservation deletion; wall time alone is not a uniqueness guarantee.
+
+Resolve once per target, after routing and before durable admission or serial gate
+selection. Carry coordinates in trusted `QueueEntry` metadata, never in provider-authored
+`NormalizedMessage`. Session keys, transcript identity, observer matching, commands, and
+runtime ownership consume the carried logical coordinate.
+
+Persist both resolved coordinates in the inbox. Replay uses the admitted coordinate even
+if the mode or reservation has since changed. Legacy rows without coordinates retain
+legacy per-thread semantics; never resolve them against today's append reservation.
+Migration and replay must preserve existing ordering and hook delivery fences.
+
+### Physical participation and history
+
+Record `(channel, physicalThread, agentId, transportScope)` participation on delivered
+inbound messages and successful outbound posts. For providers that create a thread while
+posting, record the returned physical thread. Resolve affinity independently of the
+logical session row, including after `!new`; test routing and multi-agent peer fan-out.
+
+Append transcripts use the logical coordinate, with original provider message, sender,
+physical thread, transport scope, and event identity retained as provenance. Observation
+must honor the agent's audience and routing permissions; append does not authorize reading
+all organization conversations. Deduplicate provider redeliveries before transcript fan-out.
+Do not query a provider using an `append:` coordinate as a physical thread id.
+
+Bound prompt refresh, transcript API reads, and console rendering through cursor pagination.
+Define transcript retention separately from runtime-session retention. Delete a reservation
+only if it still names the deleted session, in the same transaction. Protect admitted or
+running work from GC until it drains. Do not infer stale reservations from a missing
+session row: reservation creation legitimately precedes session creation.
+
+### Reset, mode transitions, and audience
+
+`!new` in append mode rotates the reservation using CAS. A loser rereads the winner without
+retrying the advance. This coalesces resets that observed the same generation; a later
+command that observed a new generation is a separate reset. Stable command-event deduplication
+prevents a retried command from advancing twice.
+
+Already admitted and running turns retain their old coordinate and finish in their own
+physical destinations. Later admissions use the new coordinate. This can temporarily leave
+old and new generations executing concurrently; shared workspace writes must retain their
+existing independent workspace/resource locking. Reset does not grant concurrent write safety.
+Reply text explains that the reset affects this agent's whole continuous channel. Commands
+must expose old outstanding work by explicit session/run identity so it remains cancellable.
+
+In createNew, clear context in place only while idle, retain workspace and session identity,
+and set a reset boundary that prevents replay of pre-reset messages. Record a reset event
+visible in the session timeline. Reset does not delete memory or cancel Standing Work.
+
+Mode changes do not migrate transcripts or retarget admitted messages. Switching back to
+append resumes the existing reservation if retained; if GC removed it, resolve a fresh one.
+The UI explains this and offers `!new` for a fresh generation. Audit every change/reset.
+
+Append sessions are labeled by conversation and generation start, not attributed as owned
+by the first speaker. Their audience follows the authorized conversation policy, including
+private channels and membership changes. An individual sender cannot privatize or broaden
+a shared append session. Reuse existing audience enforcement; do not assume every channel
+is organization-public. Enforce the same restrictions on console reads, continuation, and
+memory capture.
+
+### Release gate
+
+Only advertise `conversation-session-mode-v1` after coordinate persistence/replay, physical
+participation, command/reset semantics, audience enforcement, bounded history, and mixed-version
+fences pass together. Test two physical threads/one session, independent agents, concurrent
+first use, reset races, mode flips, crash replay, GC, provider destinations, and both supported
+store dialects. Existing createNew routing must remain unchanged.
+
+## 4. Ambient / standing work
+
+### Product contract
+
+A Standing Work item is a durable objective with lifecycle, execution state, bounded spend,
+and explicit notification policy. Cron and webhooks remain trigger primitives; they do not
+become the objective itself. Example: “Watch this rollout; warn on failure or an hour without
+progress; stop when it recovers.” The condition and observation state must survive restart.
+
+V1 ships fixed schedules, explicit finite expiry, pause/resume/cancel, a run timeline, and
+one approved notification destination. Adaptive scheduling and conversation wakes are later
+increments using the same contracts. The complete design below covers both.
+
+### Control-plane definition
+
+Proposed logical fields; map to existing schema types and authorization conventions during
+implementation rather than introducing parallel identity or visibility systems:
 
 ```text
-deliveryThread == sessionThread == physical thread
+StandingWork
+  id, orgId, agentId, principalId
+  name, objective
+  state: active | paused | completed | expired | cancelled
+  definitionVersion                 # incremented on edits and lifecycle changes
+  conversationRef?                   # authorized context source
+  targetDestination                  # provider, integration, channel, optional thread
+  scheduleMode: fixed | adaptive
+  fixedSchedule?, timezone
+  startAt, expiresAt                 # finite by default; org policy caps lifetime
+  minIntervalSeconds, maxIntervalSeconds, cooldownSeconds
+  maxRunsPerDay, maxNotificationsPerDay
+  budgetPolicyRef, toolPolicyRef, notificationPolicy
+  wakeOnConversation: false          # opt-in after wake support ships
+  visibilityPolicyRef
+  createdByActorId, lastModifiedByActorId, sourceSessionId?
+  createdAt, updatedAt
 ```
 
-For continuous conversation mode:
+Validate positive intervals, min ≤ max, future expiry, valid timezone/schedule, destination
+access, and compatible schedule fields. Fixed schedules must respect minimum frequency too.
+Missing numerical limits inherit finite organization defaults, never implicit unlimited spend.
+Approval binds to the definition version and effective limits; widening authority, destination,
+lifetime, or spend requires policy evaluation and renewed approval when policy requires it.
 
-```text
-deliveryThread = current provider thread
-sessionThread  = append:<monotonic timestamp>
-```
-
-### Session modes
-
-Per conversation:
-
-```text
-createNew  — current behavior
-append     — one long-lived logical session for the conversation
-```
-
-Trigger policy and session policy stay orthogonal:
-
-```text
-Trigger:
-  off | mention | any
-
-Session:
-  createNew | append
-```
-
-### Append reservation
-
-A daemon-local reservation row should own the current logical coordinate for:
-
-```text
-(agentId, channel, transportScope)
-```
-
-Suggested table:
-
-```text
-append_session_reservation
-  agentId
-  channel
-  transportScope
-  coordinate
-  updatedAt
-  PRIMARY KEY(agentId, channel, transportScope)
-```
-
-First use is atomic:
-
-1. Mint `append:<epochMs>`.
-2. `INSERT OR IGNORE`.
-3. Read the winner.
-
-The mint must be monotonic:
-
-```text
-max(now, previousMax + 1)
-```
-
-### `!new`
-
-In append mode, `!new` advances the reservation instead of changing the physical thread.
-
-Use compare-and-swap:
-
-1. Read current coordinate.
-2. Mint next coordinate.
-3. CAS current → next.
-4. If CAS loses, re-read the winner and treat it as the reset.
-5. Do not retry the advance.
-
-This makes concurrent resets converge on one new session rather than skipping multiple generations.
-
-### Transcript identity
-
-Append-mode transcript rows must use the logical `sessionThread`, not the physical thread.
-
-That ensures context from different physical threads forms one coherent conversation history.
-
-### Physical thread participation
-
-Once logical session identity is no longer equal to physical thread identity, session rows can no longer be used to infer thread ownership.
-
-Add a participation record keyed by:
-
-```text
-(channel, physicalThread, agentId, transportScope)
-```
-
-Write it when:
-
-- an inbound thread message is delivered to the agent;
-- the agent posts into a physical thread.
-
-Use that table for `threadOwner` / `threadParticipants`.
-
-### Retention
-
-When deleting a logical session, clear the append reservation only if it still points to the deleted coordinate, and do so in the same local-store transaction.
-
-This prevents retention GC from accidentally clearing a newer reservation.
-
----
-
-## 2. Ambient / standing work
-
-### Goal
-
-Let a user give an agent a durable objective such as:
-
-> Watch this rollout. Tell us if it fails or if there is no progress for an hour. Stop when it recovers.
-
-This is not just a cron job.
-
-The important distinction is:
-
-> **Cron is a schedule. Standing Work is a durable goal with state.**
-
-### Control-plane model
-
-Suggested shape:
-
-```prisma
-enum StandingWorkState {
-  active
-  paused
-  completed
-  expired
-}
-
-enum StandingWorkScheduleMode {
-  adaptive
-  fixed
-}
-
-model StandingWork {
-  id                       String   @id
-  orgId                    String
-  agentId                  String
-
-  name                     String
-  objective                String   @db.Text
-  state                    StandingWorkState
-  scheduleMode             StandingWorkScheduleMode
-
-  targetPlatform           String?
-  targetIntegrationId      String?
-  targetChannel            String?
-  targetThread             String?
-
-  fixedSchedule            String?
-  timezone                 String?
-  startAt                  DateTime?
-  expiresAt                DateTime?
-
-  minIntervalSeconds       Int
-  maxIntervalSeconds       Int
-  cooldownSeconds          Int
-  maxRunsPerDay            Int?
-  maxNotificationsPerDay   Int?
-
-  wakeOnConversation       Boolean  @default(true)
-
-  visibility               String
-  sharedWith               Json?
-
-  createdByUserId          String?
-  lastModifiedByUserId     String?
-  sourceSessionId          String?
-
-  createdAt                DateTime
-  updatedAt                DateTime
-}
-```
-
-The control plane owns the definition. The daemon owns execution state.
-
-### Daemon execution state
-
-Suggested durable local state:
+### Durable execution and handoff
 
 ```text
 standing_work_state
-  workId
-  agentId
-  nextCheckAt
-  lastRunAt
-  lastNotifiedAt
-  runsToday
-  notificationsToday
-  definitionVersion
-```
+  orgId, workId, appliedDefinitionVersion
+  nextCheckAt, lastRunAt, lastNotifiedAt
+  contextCursor, observationState, observationSchemaVersion
+  executionEpoch, leaseOwner, leaseExpiresAt
 
-and:
-
-```text
 standing_work_run
-  workId
-  runId
-  dueAt
-  status
-  startedAt
-  finishedAt
-  outcome
-  sessionId
-
-  UNIQUE(workId, dueAt)
+  orgId, workId, runId, definitionVersion, occurrenceId, dueAt
+  executionEpoch, attempt, status, startedAt, finishedAt
+  outcome, sessionId, budgetReservationId, errorCode?
+  UNIQUE(orgId, workId, definitionVersion, occurrenceId)
 ```
 
-The unique due key prevents duplicate execution after restart or holder handoff.
+`occurrenceId` is a persisted schedule occurrence/generation; changing a debounce timestamp
+does not create a new occurrence on every message. A unique key deduplicates records, not
+execution. Claim a run atomically under the current duty holder, lease, and fencing epoch.
+Lease renewal and takeover must use the existing placement authority. A stale executor may
+not commit results, enqueue notifications, or consume new authority after takeover.
+
+State required for deduplication, observation, outbox delivery, and accounting must be
+available to the successor: shared durable storage or acknowledged fenced transfer. Separate
+local SQLite files do not provide fleet-wide uniqueness. If state is unavailable, suspend
+handoff execution rather than claiming exactly-once recovery.
+
+Allow at most one active run per work. A wake during a run records pending context and one
+coalesced next occurrence. Persist state and outcome transactionally. Retry failed attempts
+under the same logical run/occurrence with bounded backoff; reuse effect identities and do
+not repeat an uncertain effect blindly. Recover expired leases; cap retries and expose a
+blocked reason rather than spinning. Across downtime, run at most one coalesced catch-up,
+then return to the current schedule. Expired/cancelled work never catches up.
 
 ### Scheduling
 
-Reuse the current scheduler infrastructure instead of building a second scheduler.
-
-Generalize the internal scheduler around:
-
-```text
-cron jobs
-one-shot due jobs
-```
-
-Standing Work schedules the next one-shot due time.
-
-In adaptive mode the model may suggest `nextCheckAt`, but the daemon must clamp it to server policy:
+Generalize the existing scheduler to support durable one-shot due jobs as well as cron.
+The persisted next due time is authoritative; an in-memory timer is only a wake mechanism.
+In adaptive mode accept the model's time as a suggestion, parse it, and clamp it to:
 
 ```text
-minInterval <= nextCheckAt <= maxInterval
+now + minIntervalSeconds <= nextCheckAt <= now + maxIntervalSeconds
 ```
 
-Never allow the model to create an unbounded tight loop.
+Then apply cooldown, budget availability, retry backoff, and expiry. These constraints take
+precedence over the maximum interval: if no legal run exists, expose the delay or expiry.
+Use a deterministic default for absent/invalid suggestions. Revalidate at admission.
 
-### Silent ambient turns
+### Context and silent execution
 
-Ambient evaluations should default to no outward reply.
+Bind work to a conversation without requiring the same live ACP session. Each work has an
+independent execution session and durable observation state. Read a bounded, authorized
+slice of human context after `contextCursor`, together with relevant previous observations.
+This supports both createNew and append and avoids blocking a human session with polling.
+Advance the cursor with committed observation state, not merely after reading messages.
+Record source event ids and timestamps; unavailable context is reported as unavailable.
 
-Add a daemon-injected tool:
+A conversation `!new` resets human session context; it neither cancels work nor erases its
+objective/state. Conversation-bound work continues following authorized new conversation
+events. Users stop it with pause/cancel. Revoked access blocks further context reads/effects.
+
+Ambient execution has no normal outward final reply, status chatter, or unrestricted
+`sendMessage`. Enforce this in turn output and tool/credential policy. Shell, network, and
+other tools must not provide an alternate unauthorized write path. V1 is read-only checking
+plus the controlled notification dispatcher. Future mutating work requires explicit grants,
+effect-specific policy, and the same audit/budget boundaries.
 
 ```ts
 reportStandingWork({
-  outcome:
-    | 'no_change'
-    | 'notify'
-    | 'blocked'
-    | 'complete',
+  outcome: 'no_change' | 'notify' | 'blocked' | 'complete',
   summary?: string,
   notification?: string,
   nextCheckAt?: string
 })
 ```
 
-The trusted work id comes from session context, not model arguments.
+Work/run identity comes from trusted execution context. Accept one terminal report per run;
+retries return its recorded result. `no_change` stays silent; `notify` creates a notification
+intent; `blocked` records a reason and may notify under policy; `complete` disarms further
+checks and may create a final notification. Missing reports, malformed output, and timeouts
+are bounded failed attempts, not implicit success or permission to publish final model text.
 
-Semantics:
+### Notification outbox and delivery semantics
 
-- `no_change`: no message, schedule next check.
-- `notify`: send an outward notification, then schedule next check.
-- `blocked`: optionally notify under cooldown policy.
-- `complete`: optional final notification, mark complete, disarm.
-
-### Exactly-once notification
-
-The model should not separately call `sendMessage()` and then `reportStandingWork()`.
-
-Instead, `reportStandingWork(outcome='notify')` should perform the durable notification transaction:
-
-1. claim notification idempotency key;
-2. send;
-3. persist delivery receipt;
-4. finalize run;
-5. schedule next check.
-
-Use:
+Commit outcome, observation state, next schedule/completion event, and any notification
+intent in one storage transaction. Network delivery is outside that transaction.
 
 ```text
-(runId, notificationIndex)
+notification_outbox
+  orgId, workId, runId, notificationIndex, effectId
+  definitionVersion, destination, payload, payloadHash
+  status: pending | sending | delivered | uncertain | failed | suppressed
+  attempt, nextAttemptAt, providerReceipt?, lastError?
+  UNIQUE(orgId, runId, notificationIndex)
 ```
 
-as the idempotency key.
+Before sending, revalidate lifecycle, version, destination authorization, and budget; reserve
+notification quota atomically. Suppress stale pending intents after pause, cancellation,
+expiry, or definition replacement. A completion report's own final notification remains
+eligible under that exact completed version; later cancellation/revocation still suppresses it.
 
-### Agent-created work
+Use a stable provider idempotency key when supported. A send followed by a crash before
+receipt persistence is ambiguous: local uniqueness cannot prove whether the provider accepted
+it. Reconcile by provider receipt/key when possible. Without provider deduplication or reliable
+reconciliation, default to `uncertain`, surface it in the console, and do not automatically
+resend. An explicit retry warns of possible duplication and remains audited and quota-bound.
+This avoids blind duplicates but may miss a notification; do not advertise universal
+exactly-once delivery. Definitively failed, retryable sends use capped backoff. Completion
+of evaluation and completion of notification delivery are separately visible states.
 
-Add a management tool such as:
+### Management and approval
 
-```ts
-manageStandingWork(...)
-```
+`manageStandingWork` supports create, inspect, edit, pause, resume, and cancel under the
+requesting actor's permissions. Creation policy is `deny | ask | allow`, default `ask`.
+The approval shows objective, principal, context scope, tool/effect permissions, check range,
+expiry, spending limits, and destination. An approval grants only that version's scope;
+model-generated content cannot expand it. Idempotent management requests prevent duplicate
+work creation. Resume revalidates authorization, limits, and expiry.
 
-Creation policy:
+The console exposes lifecycle, next check, blocked reason, run history, spending, notification
+status including uncertain delivery, and pause/cancel before the first production release.
+Basic controls are not deferred behind adaptive scheduling.
 
-```text
-deny | ask | allow
-```
+### Conversation wakes and loop control
 
-Default should be `ask`, because standing work creates future model spend and future outward side effects.
+Opt-in conversation wake debounces authorized new events, advances one pending occurrence,
+and respects the same minimum interval, quotas, and cooldowns as scheduled runs. Continuous
+chat must neither cause a run per message nor postpone checks indefinitely: use a maximum
+coalescing delay. Webhooks use the same authenticated/deduplicated admission path.
 
-The approval card should show at least:
+Stamp trusted provenance `kind=standing_work`, `workId`, `runId`, `effectId`, and causal parent.
+A work item does not wake from its own notifications. Cross-work cycles use the shared loop
+breaker and bounded causal-hop/rate policies; provider text cannot forge trusted provenance.
 
-- objective;
-- check-frequency range;
-- expiration;
-- notification destination.
+### Release gate
 
-### Conversation wake
+Inject crashes before/after claim, outcome commit, provider send, and receipt commit. Test
+two holders, lease expiry, stale completion, edits/pause/cancel during runs, missing state on
+handoff, repeated reports, budget exhaustion, permission revocation, silent default output,
+catch-up, and notification uncertainty. A timer firing successfully is not sufficient.
 
-When `wakeOnConversation=true`, new conversation activity should debounce and advance `nextCheckAt` to a near-future time rather than immediately starting a model pass per message.
+## 5. Agent Identity v1
 
-This lets standing work incorporate fresh human context without generating message storms.
+An organization owns the execution principal. Agent instances and human creators reference
+it; they are not the principal itself. Bind provider identities and credentials through
+revocable grants with resource, action, expiry, and policy revision. Preserve actor versus
+executor versus provider attribution in every effect.
 
-### Loop protection
+Build on the existing GitHub App installation/token broker and repository grants. First
+standardize organization-owned GitHub App/service-account bindings, scoped short-lived token
+issuance, rotation, revocation, and explicit repository access. Do not introduce another
+long-lived daemon secret store. The existing deployment-owned GitHub App can provide an
+organization-scoped installation identity; per-org self-managed Apps are a separate adapter.
+Human OAuth remains explicitly delegated human authority, never silently converted to an
+organization identity.
 
-Standing-work notifications need trusted provenance:
+Management includes principal owners, grants, provider bindings, and a disable action.
+Disabling a principal blocks new runs and new effects and reconciles active work. Test
+cross-org denial, removal of the creating user, expired/revoked credentials, and audit
+attribution. The minimum principal/grant contract precedes Standing Work; richer UI follows.
 
-```text
-kind = standing_work
-workId
-runId
-```
+## 6. Unified Audit
 
-A work item must not wake itself from its own notification.
+Extend existing audit/trace infrastructure with versioned events and a common causal envelope:
+`eventId`, organization, actor, principal, agent, conversation/session, work/run, tool call,
+effect, parent event, time, policy revision, decision, and outcome. Use stable event ids for
+idempotent ingestion and retain both event time and ingestion time for offline delivery.
 
-Reuse the existing loop breaker.
+Capture definition changes and approvals, admission/denial, reset, tool invocation/result,
+credential issuance metadata, mediated network decisions, external effects and receipts,
+budget reservation/settlement, lifecycle, and handoff. Record redacted metadata by default;
+never put credentials or unrestricted tool bodies in audit payloads. Apply audience, retention,
+and administrative access controls to audit search/export.
 
----
+Use a durable local event outbox for interrupted CP connectivity. Failure to durably record
+an authorized external-effect intent blocks that effect. Full arbitrary process/network
+coverage requires sandbox/proxy instrumentation: report capability/coverage gaps explicitly,
+not a falsely complete trace. Events cannot be rewritten through ordinary application APIs;
+retention deletion is a separately authorized, audited operation.
 
-## 3. Relationship between the two features
+Acceptance: trace one human request or scheduled occurrence through tools and final provider
+receipt, including denied and uncertain actions, with correct organization isolation and
+no secrets. Minimal provenance ships with sessions/work; full search, export, and network
+coverage arrive incrementally.
 
-Persistent conversation and Standing Work reinforce each other.
+## 7. Budgets & quotas
 
-A conversation-bound Standing Work item can resume the same logical `append:<id>` session for each ambient evaluation. This means the agent can see:
+Policy hierarchy is Org → Agent → Conversation / Schedule / Standing Work. A run may be
+charged to both a work and its conversation, but only once to shared ancestors. Enforce all
+applicable limits using a single usage attribution identity. Child policy cannot raise an
+ancestor cap. Separate money/token limits from concurrency, runtime, run-count, tool-call,
+and notification quotas.
 
-- prior human instructions;
-- earlier ambient checks;
-- previous notifications;
-- follow-up corrections from the team.
+Admission atomically reserves a bounded maximum allowance before model/tool execution.
+Concurrent holders cannot each spend the same remaining balance. Settle actual usage and
+release unused allowance idempotently; preserve uncertain reservations until reconciled.
+Retries and failed attempts consume actual usage too. Daily periods have a defined policy
+timezone and period key; rolling windows use their own explicit policy.
 
-Example:
+A true monetary hard cap requires enforceable per-call/run ceilings and known conservative
+cost bounds. If a runtime cannot enforce or report those, do not label estimates as hard
+caps: disallow it for strict-budget work or offer an explicitly soft policy. Offline agents
+may spend only preallocated leased allowance; they cannot invent additional balance.
+Expired execution must be fenced before unused allowance is reclaimed.
 
-```text
-#deployments
+Expose reserved/spent/remaining usage, thresholds, block reasons, and reset time. Alert once
+per threshold transition with deduplication. Raising limits requires authorization and an
+audit event; it does not silently renew expired work. V1 Standing Work needs finite execution
+and notification limits; hierarchical management and billing integrations can follow.
 
-User:
-  Keep watching this rollout. Tell us if it fails or
-  if there has been no progress for an hour.
+## 8. Memory scopes and provenance
 
-Agent:
-  creates Standing Work after approval
+Use explicit conversation, workspace, and organization scopes. Every entry records source
+conversation/session/run/event references, creator principal, extraction method/version,
+creation/update time, audience policy, and retention/expiry. Reading a broader scope requires
+an independent grant; a useful conversation fact does not automatically become org memory.
 
-Ambient run:
-  no_change
-  → silent
+Promotion between scopes is an authorized operation with audit and source attribution.
+Treat retrieved content as data, never as tool authorization. Revocation and audience changes
+must invalidate retrieval caches and prevent newly unauthorized reads. `!new` clears active
+session context, not stored memory; the UI states this and provides separate memory controls.
 
-Ambient run:
-  notify
-  → posts warning in #deployments
+Administrators with the appropriate scope can inspect, edit, and delete. Delete tombstones
+prevent background extractors from recreating the same deleted entry from old source events;
+propagate deletion to indexes, caches, and derived summaries under a documented retention
+policy. Distinguish deletion of a memory entry from deletion of its source transcript and
+backup retention. Acceptance covers cross-scope denial, promotion, source inspection,
+revocation, and deletion/re-extraction, not only retrieval quality.
 
-User:
-  We restarted shard 3 manually.
+## 9. Sandbox hardening
 
-Next ambient run:
-  resumes the same logical conversation session
-  and sees that update.
-```
+Production blockers gate releases as they are verified; they are not postponed to the seventh
+feature release. Maintain a threat model for untrusted repositories, tool output, dependencies,
+and model-issued commands. Isolate filesystem/workspaces and host sockets, constrain network
+egress, broker scoped credentials, limit resources, and clean up orphaned executions.
 
----
+An execution requiring isolation fails closed if the configured backend is unavailable.
+Credential and network boundaries must enforce Standing Work's read-only policy rather than
+relying on a prompt. Define capabilities per backend and prevent placement on one that cannot
+meet the requested policy. Shared workspaces require mutation coordination even when two
+sessions are individually sandboxed.
 
-## 4. Recommended implementation sequence
+Acceptance includes host/other-tenant access attempts, unauthorized egress and credential use,
+backend startup failure, resource exhaustion, cancellation, and cleanup after crashes. Close
+or explicitly mitigate verified blockers before enabling corresponding production workloads.
 
-```text
-PR 1  Coordinate plumbing
-PR 2  sessionMode config + capability fence
-PR 3  Append reservation store
-PR 4  Append runtime activation
-PR 5  Physical-thread participation
-PR 6  !new + final session-mode UX
+## 10. ACP v2 convergence
 
-PR 7  StandingWork schema/API
-PR 8  One-shot due scheduler
-PR 9  Silent ambient turns
-PR 10 reportStandingWork
-PR 11 Exactly-once notification
-PR 12 manageStandingWork + approval
-PR 13 Conversation wake
-PR 14 Console Standing Work UI
-```
+Start with an inventory mapping current proprietary runtime operations to capabilities in
+the supported ACP versions: session lifecycle, streaming, cancellation, tools/permissions,
+usage, and resumption. Verify the actual negotiated protocol and runtime support during
+implementation; the “v2” goal does not assume every required primitive exists everywhere.
 
-The first four PRs intentionally keep behavior changes isolated. Only the runtime activation PR should advertise the daemon capability and enable `append` in production.
+Introduce an adapter boundary and parity tests, then migrate supported operations one at a
+time. Keep AgentConnect's organization policy, placement, durable work scheduling, budget
+accounting, and external delivery as platform responsibilities. Standardizing the runtime
+wire does not remove these responsibilities or weaken their fences.
 
-## 5. Non-negotiable invariants
+Mixed runtimes negotiate capabilities; unsupported optional features are clearly unavailable,
+and required ones block admission. Maintain a documented compatibility window, telemetry,
+and rollback before deleting legacy paths. Acceptance requires lifecycle/cancellation,
+permission, usage, and reconnect parity without losing provenance or budget enforcement.
 
-1. **Physical thread ≠ session identity.**
-2. **Standing Work ≠ Cron.**
-3. **Ambient evaluation is silent by default.**
-4. **Session coordinates are resolved once per target and carried downstream.**
-5. **Mixed-version deployments must fail closed rather than silently downgrade `append` to `createNew`.**
-6. **Future side effects require deterministic daemon-side limits, not prompt-only policy.**
+## 11. Incremental implementation sequence
+
+These work-package IDs replace the old prospective PR numbering. Existing PR1/PR2 documents
+keep their names and scope; completed commits are not renumbered. A package may span several
+PRs. “Foundation” means the shared contract and minimum enforcement, not the whole later UI.
+
+| Package | Deliverable                                                                                 | Dependencies / exit condition                          |
+| ------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| F0      | Identity/provenance/audience/budget contracts; verified production-blocker inventory        | Before autonomous release; use existing infrastructure |
+| C1      | Coordinate plumbing (existing PR1)                                                          | No behavior change                                     |
+| C2      | Config + capability fence (existing PR2)                                                    | No capability advertisement                            |
+| C3      | Reservation store and monotonic clock                                                       | Atomicity and GC tests                                 |
+| C4      | Physical-thread participation writers/readers                                               | Existing routing preserved; real physical ids          |
+| C5      | Durable coordinates, replay, observation and runtime routing                                | C1–C4; restart/mode-change tests                       |
+| C6      | Reset commands, mode UX, audience and paginated history                                     | C5; complete session acceptance suite                  |
+| C7      | Advertise append capability                                                                 | C1–C6 pass; supported placements only                  |
+| F1      | Minimal execution principal, durable audit, quota reservation, enforced tool/sandbox policy | F0; required before W release                          |
+| W1      | Versioned work schema/API and approval-bound lifecycle                                      | F0; creation remains gated                             |
+| W2      | Durable due scheduling, run claims, leases and handoff recovery                             | W1; shared/transfer storage contract                   |
+| W3      | Independent context/state and enforced silent read-only turns                               | W2 + F1                                                |
+| W4      | Idempotent report, transactional outbox and delivery recovery                               | W3; no universal exactly-once claim                    |
+| W5      | Management/approval tools and console controls/timeline                                     | W1–W4; pause/cancel and uncertainty visible            |
+| W6      | Release fixed-schedule Standing Work                                                        | F1 + W1–W5 acceptance and failure-injection gates      |
+| I1      | Full Agent Identity v1 management                                                           | Extend F1; GitHub/service-account lifecycle            |
+| A1      | Unified Audit search/export and expanded coverage                                           | Extend F1 and effect events                            |
+| B1      | Full hierarchical budgets, allocation and alerts                                            | Extend F1; strict-cap runtime compatibility            |
+| W7      | Adaptive scheduling and conversation/webhook wakes                                          | W6; bounded scheduling, budgets and loop tests         |
+| M1      | Memory scope/provenance and administrative lifecycle                                        | Identity/audience/audit foundations                    |
+| S1      | Continued sandbox hardening and backend parity                                              | Blockers handled throughout, not deferred here         |
+| P1      | ACP capability mapping, adapters, migration and deprecation                                 | Preserve identity/audit/budget/isolation contracts     |
+
+C1–C7 deliver useful sessions independently of full Standing Work. W6 delivers a bounded
+active teammate independently of W7. Identity, audit, memory, sandbox, and protocol packages
+may progress in parallel once their shared contracts are fixed. Every implementation PR
+should identify the package, invariants touched, migration/rollback behavior, and concrete
+validation; update status only with implementation/test evidence.
+
+## 12. Non-negotiable invariants
+
+1. Physical delivery and logical session identity are separate, resolved once before admission.
+2. Durable replay preserves the original admitted identity; resets and edits cannot retarget it.
+3. Standing Work is a versioned objective with durable observation state, not merely a timer.
+4. Autonomous execution is silent and bounded by enforced authority, budget, and isolation.
+5. A unique database row is not proof of unique execution or exactly-once external delivery.
+6. Stale holders and stale definition versions cannot commit new authorized effects.
+7. Actor, execution principal, source context, tool use, and external effects remain traceable.
+8. Conversation visibility, memory scope, and provider permissions are authorization boundaries.
+9. Mixed-version deployments fail closed; capability advertisement follows complete release gates.
+10. Each phase is independently usable; later feature ambition does not bypass current safeguards.
