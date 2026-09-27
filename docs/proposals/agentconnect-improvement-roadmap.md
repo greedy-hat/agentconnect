@@ -1,26 +1,47 @@
 # AgentConnect Improvement Roadmap
 
-> Status: code inspection snapshot, 2026-09-26. This describes the local working
-> tree, not a merged release. C1–C7 and F0/F1 have committed implementations;
-> substantial Standing Work, Principal, and Audit changes remain uncommitted.
-> W1–W5 have core implementations, W6 release gates remain open, W7 and I1 are
-> partial, and A1 has search/export and a gated recording/ingestion path with
-> enforcement and coverage gaps. Execution is OFF by default. Requirements below
-> describe the target contract unless explicitly identified as implemented.
-> See [next steps and acceptance evidence](agentconnect-next-steps.md).
+> Status: branch inspection snapshot, 2026-09-27, for
+> `proposal/conversation-session-and-standing-work`. This is implementation state,
+> not a production-release claim. C1–C7 are implementation-complete and now need
+> release evidence rather than architectural rework. W1–W5 form a real Standing Work
+> vertical slice; W6 remains blocked by contract correctness, live authority/policy
+> enforcement, production enablement, and failure-injection evidence. W7 is an
+> experimental follow-on and does not block fixed-schedule V1. Principal management
+> exists but runtime enforcement is not closed. Audit has a durable pipeline and
+> console, but production enablement, fail-closed effect intent, and wider coverage
+> remain open. Execution and execution audit are OFF by default, and no production
+> CLI/environment wiring was found. Requirements below describe the target contract
+> unless explicitly identified as implemented. See
+> [next steps and acceptance evidence](agentconnect-next-steps.md).
 
 ## 1. Product goals and delivery strategy
 
-The complete roadmap has eight product tracks, in this priority order:
+The complete roadmap has eight product tracks:
 
-1. **Conversation-native persistent sessions** ✅: make channel/thread continuity a supported product.
-2. **Ambient / standing work** 🟡 (W1–W5 core present; W6 open; W7 partial; execution OFF): durable objectives built on auto, cron, and webhook primitives.
-3. **Agent Identity v1** 🟡 (management present; execution revocation incomplete; UI OFF): organization-owned principals, initially GitHub App and service accounts.
-4. **Unified Audit** 🟡 (search/export, recording and flush present; fail-closed intent and broader coverage missing): provenance from task admission through tools, network access, and external effects.
+1. **Conversation-native persistent sessions** ✅ (implementation complete; release evidence pending): make channel/thread continuity a supported product.
+2. **Ambient / standing work** 🟡 (W1–W5 core implemented; W6 release blocked; W7 experimental; execution OFF): durable objectives built on scheduler, conversation, and webhook primitives.
+3. **Agent Identity v1** 🟡 (management plane implemented; enforcement plane incomplete): organization-owned principals, grants, provider bindings, and revocation.
+4. **Unified Audit** 🟡 (durable pipeline/search/export/UI implemented; fail-closed intent, production enablement, and broader coverage open): provenance from task admission through tools, network access, and external effects.
 5. **Budgets & quotas** 🔴 (flat limits only, no hierarchy): Org → Agent → Conversation / Schedule / Standing Work, with hard caps and alerts.
 6. **Memory scopes + provenance** 🟡 (agent-scoped done, scope hierarchy missing): conversation, workspace, and organization memory with administrative controls.
 7. **Sandbox hardening** 🟡 (3 backends done, network policy + macOS remain): close production blockers and enforce execution and credential boundaries.
 8. **ACP v2 convergence** 🔴 (not started): use negotiated standard runtime capabilities and reduce proprietary remote protocol.
+
+Product priority is not the same as the immediate release order. Before adding more autonomous
+surface area, the current branch should close these cross-cutting gates in order:
+
+1. **Correctness closure** — preserve and enforce every safety-relevant projected field,
+   starting with `minIntervalSeconds`.
+2. **Authority closure** — Principal/Grant state must fence creation, admission, context reads,
+   and external effects, including disable/revoke races.
+3. **Policy enforcement closure** — resolve and enforce budget/tool/notification/visibility
+   policy references, or remove claims that the runtime enforces them.
+4. **Production enablement** — wire explicit operator configuration and advertise capabilities
+   only when the corresponding runtime path is actually enabled.
+5. **Release evidence** — fault-injection, takeover, stale-executor, uncertain-effect, revocation,
+   and mixed-version tests become release gates.
+6. **Engineering hardening** — split current complexity hotspots along existing domain seams
+   without changing the deployment model or rewriting working state machines.
 
 This is product priority, not an instruction to defer all safety and reliability work until
 its numbered track. Minimal identity, audit, budget, audience, and sandbox contracts are
@@ -77,12 +98,46 @@ Feature-gate each new wire behavior. Check all eligible placements and shared-bo
 and fence both register snapshots and live pushes. Unsupported or unknown capability
 fails closed. Do not silently reinterpret a configured feature as legacy behavior.
 
-## 3. Conversation-native persistent sessions — IMPLEMENTED
+### Contract fidelity and module boundaries
 
-> Status 2026-09-23: C1–C7 complete. The daemon advertises
-> `conversation-session-mode-v1`. Append-mode coordinate admission, durable
-> replay, reset CAS, and physical thread affinity have committed implementations.
-> This inspection does not establish deployment or production rollout status.
+A safety-relevant concept may have distinct HTTP, domain, persistence, wire, daemon-domain,
+and daemon-persistence representations, but every boundary crossing is an explicit mapping.
+No projected field may disappear silently. Add mapping/round-trip contract tests for authority,
+intervals, budgets, policies, expiry, destination, and effect identity so schema evolution
+fails loudly instead of degrading semantics.
+
+Keep the current monorepo/process boundaries. Engineering hardening means smaller cohesive
+modules, not microservices or framework-heavy indirection. In particular:
+
+- `LocalStore` keeps the shared database/transaction seam but domain persistence moves behind
+  focused stores/repositories for sessions, transcripts, append reservations, Standing Work,
+  audit outbox, memory, and related concerns.
+- `daemon.ts` is a composition root: lifecycle and dependency wiring belong there; provider/
+  Claude ambient execution details belong in runtime adapters.
+- Standing Work keeps its existing state machine, leases, epochs, and outbox semantics while
+  definition/scheduling/execution/delivery/wake code moves into cohesive modules.
+- Control-plane HTTP routes validate transport input and delegate business orchestration to
+  application services instead of accumulating lifecycle, authorization, persistence, and
+  projection logic in one route file.
+- Web data access becomes feature-local queries/mutations instead of continuing to expand a
+  single `api.ts` and global `ConsoleData` context.
+
+Security policy is capability-based. Tool/effect metadata should become typed and bounded;
+tool names or regex matching may remain defense-in-depth but cannot be the primary authority
+model. Audit detail bags must be size-bounded and increasingly typed/allow-listed rather than
+depending only on blacklist redaction.
+
+## 3. Conversation-native persistent sessions — IMPLEMENTATION COMPLETE / RELEASE EVIDENCE PENDING
+
+> Status 2026-09-27: C1–C7 are implemented. The daemon advertises
+> `conversation-session-mode-v1`; delivery/session coordinate separation,
+> append reservation with a persisted monotonic clock, durable replay, reset CAS,
+> and physical-thread affinity are present in code. Do not redesign this subsystem
+> for the Claude Tag transition. Remaining work is release evidence: migration and
+> replay matrices, concurrent first-admission/reset races, retention/GC interactions,
+> multi-agent fan-out, mode transitions with queued work, mixed-version rollout, and
+> provider-specific physical-thread affinity. This inspection does not establish
+> deployment or production rollout status.
 
 ### Coordinates and defaults
 
@@ -179,12 +234,19 @@ was not rerun in the 2026-09-26 inspection.
 
 ## 4. Ambient / standing work
 
-> Status 2026-09-26: W1–W5 core code is present; W6 is not release-ready.
-> W7 has adaptive scheduling and a conversation-wake entry point, but bounded
-> coalescing, trusted loop provenance, webhook admission, and configured interval
-> enforcement are incomplete. Execution requires the daemon constructor option
+> Status 2026-09-27: W1–W5 are a real vertical slice rather than a design-only
+> proposal: CP definitions/projections, daemon durable scheduling, claims/leases,
+> isolated ambient execution, structured reports, notification outbox/delivery,
+> run reporting, and console inspection/control are present. W6 is not release-ready.
+> A concrete correctness blocker exists: CP/wire carry `minIntervalSeconds`, but the
+> daemon durable definition does not persist it and current adaptive/wake code derives
+> an effective minimum from `maxIntervalSeconds` with a 60-second cap. Policy refs are
+> projected but not fully resolved/enforced at runtime. Execution requires
 > `standingWorkExecution === true`; no production CLI/environment wiring was found.
-> The `standing-work` console flag only hides/shows UI, not CP APIs.
+> W7 has adaptive scheduling and a conversation-wake entry point, but bounded
+> coalescing, durable pending wakes, trusted loop provenance, webhook admission, and
+> configured interval enforcement remain incomplete. W7 does not block fixed-schedule
+> V1. The `standing-work` console flag only hides/shows UI, not CP APIs.
 > See [W1–W6 gates](standing-work-w1-w6-completion-plan.md) and
 > [W7 implementation gaps](standing-work-w7-adaptive-wakes-plan.md).
 
@@ -199,10 +261,29 @@ V1 ships fixed schedules, explicit finite expiry, pause/resume/cancel, a run tim
 one approved notification destination. Adaptive scheduling and conversation wakes are later
 increments using the same contracts. The complete design below covers both.
 
+### Fixed V1 release-critical gaps
+
+Before W6 can ship, preserve `minIntervalSeconds` in daemon durable state and use the configured
+value in both adaptive scheduling and conversation-wake admission. Add migration/restart tests
+that prove values such as min=3600/max=86400 survive projection, persistence, restart, and wake.
+
+Close authority at three points: definition create/edit, run admission/context read, and every
+external effect. Principal disable or grant revoke must advance/reconcile authority so stale
+work cannot continue solely because it has an older projected revision.
+
+The CP/wire fields `budgetPolicyRef`, `toolPolicyRef`, `notificationPolicy`, and
+`visibilityPolicyRef` currently promise more semantics than the daemon demonstrably enforces.
+Either resolve and enforce them for V1 or narrow the V1 contract. Do not add more policy fields
+until existing references have executable meaning.
+
+Add production operator wiring for `standingWorkExecution` and `executionAudit`, while
+retaining fail-closed capability advertisement. Fixed V1 then requires crash/takeover,
+pause/cancel/edit/revoke-during-run, notification-uncertainty, and shared-store fencing tests.
+
 ### Control-plane definition
 
-Proposed logical fields; map to existing schema types and authorization conventions during
-implementation rather than introducing parallel identity or visibility systems:
+The control plane and wire already implement the core logical fields below. Daemon mappings
+must preserve their semantics rather than silently dropping fields:
 
 ```text
 StandingWork
@@ -215,7 +296,7 @@ StandingWork
   scheduleMode: fixed | adaptive
   fixedSchedule?, timezone
   startAt, expiresAt                 # finite by default; org policy caps lifetime
-  minIntervalSeconds, maxIntervalSeconds, cooldownSeconds
+  minIntervalSeconds, maxIntervalSeconds
   maxRunsPerDay, maxNotificationsPerDay
   budgetPolicyRef, toolPolicyRef, notificationPolicy
   wakeOnConversation: false          # opt-in after wake support ships
@@ -373,16 +454,16 @@ catch-up, and notification uncertainty. A timer firing successfully is not suffi
 
 ## 5. Agent Identity v1
 
-> Status 2026-09-26: I1 is partial. Org-scoped Principal/PrincipalGrant
-> persistence, CRUD/lifecycle/grant APIs, and the `principals` console surface
-> exist. Disable/enable update the principal revision, and `checkGrant()` checks
-> active state and grant expiry/revocation. However, no production caller of
-> `checkGrant()` was found. Disable does not reconcile existing Standing Work
-> definitions or push a new authorization projection to executing daemons.
-> Tests invoking `checkGrant()` directly prove the service predicate, not live
-> executor fencing. Provider binding/token lifecycle and end-to-end revocation
-> must be connected and verified before calling I1 complete. The console flag
-> defaults OFF; it does not disable the CP API.
+> Status 2026-09-27: the **management plane is implemented; the enforcement plane
+> is incomplete**. Org-scoped Principal/PrincipalGrant persistence, lifecycle/grant
+> APIs, audit, and the `principals` console surface exist. Disable/enable advance
+> the principal revision, and `checkGrant()` correctly checks active state and
+> grant expiry/revocation. However, no production execution caller of
+> `checkGrant()` was found. Standing Work create/edit only validates principal
+> existence/state; disable/revoke does not yet reconcile affected definitions and
+> fence later run/effect admission end-to-end. Provider binding/token lifecycle and
+> live revocation still need to be connected and verified. The console flag defaults
+> OFF; it does not disable the CP API.
 
 An organization owns the execution principal. Agent instances and human creators reference
 it; they are not the principal itself. Bind provider identities and credentials through
@@ -402,35 +483,29 @@ Disabling a principal blocks new runs and new effects and reconciles active work
 cross-org denial, removal of the creating user, expired/revoked credentials, and audit
 attribution. The minimum principal/grant contract precedes Standing Work; richer UI follows.
 
+### Authority closure (AUTH1)
+
+Treat this as a release dependency of fixed Standing Work, not as optional identity polish.
+Create/edit verifies the principal and all grants needed for the requested context/destination.
+Run admission rechecks the current principal revision and read/execute authority. Immediately
+before an external effect, recheck lifecycle, revision, destination, and effect grant. Principal
+disable, grant revoke, or grant expiry reconciles affected work and prevents stale revisions
+from authorizing new operations. Human actor conversation access and execution-principal grants
+remain separate authorities; satisfying one never implies the other.
+
 ## 6. Unified Audit
 
-> Status 2026-09-26 (partial implementation): the CP `AuditEvent` table now carries a real
-> causal envelope — unique `eventId`, `traceId`, `parentEventId`, `effectId`,
-> `principalId`, `source` (`cp`|`daemon`) and `occurredAt`, with org/kind/trace/effect
-> indexes — and exposes owner-only search (org-scoped, cursor-paginated) plus a bounded
-> JSON export. The unscoped global `recent()` read is gone. On the daemon, a gated
-> `DaemonAuditRecorder` persists `admission` and `external_effect` (intent and result)
-> rows into the durable outbox at the Standing Work pump's claim and delivery sites;
-> event ids derive from persisted facts, so a retried claim or swept-again delivery
-> rewrites one row. It is OFF by default (`executionAudit`, and only reachable where
-> `standingWorkExecution` already runs). Those rows now leave the daemon: a background
-> drain sends one `audit/flush` request per organization (≤100 events), and releases a
-> row only once its id comes back in `accepted` or `rejected`, so a lost reply costs a
-> duplicate write and never a fact. The ingest resolves each event's agent against the
-> envelope's organization and the placement fence, and absorbs a replayed `eventId` as
-> the same record. A pool member drains only the rows about agents it serves, and no
-> frame is sent unless the operator gate is on _and_ the connected CP advertises
-> `execution-audit-v1`. The console reads it now: `/audit` (behind the `audit` flag,
-> OFF by default) lists the trail newest-first, names the writing side per row, opens
-> a row into its full causal envelope, narrows by kind, agent or trace id, and exports
-> the filtered trail as JSON. A read that fails — a non-owner's 403 — surfaces as the
-> error it is rather than as an empty trail. What is still missing: coverage of tool,
-> process or network events beyond the Standing Work pump's admission and effect sites.
-> A separate release blocker is intent durability: `DaemonAuditRecorder` catches
-> persistence failures and returns null, while `StandingWorkPump` still sends the
-> notification. The fail-closed intent requirement below is not implemented.
-> Recording uses the constructor option `executionAudit`; no production
-> CLI/environment wiring was found. Console gates do not disable the read APIs.
+> Status 2026-09-27: the **durable audit transport/persistence pipeline is implemented**,
+> while production enablement and coverage are incomplete. The CP stores a causal envelope
+> with stable event ids and exposes owner-only search/export; the daemon has a durable audit
+> outbox and bounded `audit/flush` with idempotent CP ingestion. Standing Work records
+> admission/effect facts and the console can inspect them. Recording remains OFF by default,
+> with no production CLI/environment wiring found. Coverage is still concentrated around
+> Standing Work rather than all tool/process/network/credential decisions. A release blocker
+> remains: failure to durably record an authorized external-effect intent must block the
+> effect. Audit metadata should also move toward typed/allow-listed, size-bounded detail
+> shapes instead of relying only on generic `Record<string, unknown>` plus blacklist
+> redaction. Console gates do not disable the read APIs.
 
 Extend existing audit/trace infrastructure with versioned events and a common causal envelope:
 `eventId`, organization, actor, principal, agent, conversation/session, work/run, tool call,
@@ -561,50 +636,83 @@ and required ones block admission. Maintain a documented compatibility window, t
 and rollback before deleting legacy paths. Acceptance requires lifecycle/cancellation,
 permission, usage, and reconnect parity without losing provenance or budget enforcement.
 
-## 11. Incremental implementation sequence
+## 11. Engineering hardening for long-term Claude Tag evolution
+
+This branch already has the right macro-architecture: protocol contracts, control-plane
+authority, daemon-owned execution, durable stores, and a separate console. Do not rewrite it.
+Harden the current complexity hotspots before adding another large set of autonomous features.
+
+**E1 module-boundary hardening** keeps behavior stable while changing physical ownership:
+
+- Split `LocalStore` behind domain stores/repositories while preserving the existing shared
+  database, transaction seam, migrations, and cross-domain transactional operations where
+  they are genuinely required.
+- Split `execution/standing-work.ts` into definition/report, scheduling/pump, executor/context,
+  delivery, and wake modules. Preserve leases, execution epochs, occurrence identity, and outbox
+  semantics.
+- Move ambient Claude/runtime construction out of `daemon.ts` into a runtime adapter so
+  `daemon.ts` primarily composes and starts/stops components.
+- Move Standing Work business orchestration from the HTTP route into an application service;
+  keep repositories persistence-focused and protocol projection explicit.
+- Replace the expanding Web `ConsoleData`/single `api.ts` model with feature-local
+  Standing Work, Principal, Audit, Session, Agent, and Integration query/mutation modules.
+- Add contract-fidelity tests across CP domain → protocol projection → daemon domain →
+  daemon persistence for every autonomous-work field.
+
+This is not a microservice milestone. No network boundary, DI framework, or generic
+event-sourcing/CQRS layer is required. The exit condition is that new Claude Tag capabilities
+can be added as cohesive modules without extending a few god files or silently dropping
+cross-layer contract fields.
+
+## 12. Incremental implementation sequence
 
 These work-package IDs replace the old prospective PR numbering. Existing PR1/PR2 documents
 keep their names and scope; completed commits are not renumbered. A package may span several
 PRs. “Foundation” means the shared contract and minimum enforcement, not the whole later UI.
 
-| Package | Deliverable                                                                                 | Dependencies / exit condition                          | Status                                                                                          |
-| ------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| F0      | Identity/provenance/audience/budget contracts; verified production-blocker inventory        | Before autonomous release; use existing infrastructure | Foundation contracts/inventory present; not release certification                               |
-| C1      | Coordinate plumbing (existing PR1)                                                          | No behavior change                                     | ✅ Done                                                                                         |
-| C2      | Config + capability fence (existing PR2)                                                    | No capability advertisement                            | ✅ Done                                                                                         |
-| C3      | Reservation store and monotonic clock                                                       | Atomicity and GC tests                                 | ✅ Done                                                                                         |
-| C4      | Physical-thread participation writers/readers                                               | Existing routing preserved; real physical ids          | ✅ Done                                                                                         |
-| C5      | Durable coordinates, replay, observation and runtime routing                                | C1–C4; restart/mode-change tests                       | ✅ Done                                                                                         |
-| C6      | Reset commands, mode UX, audience and paginated history                                     | C5; complete session acceptance suite                  | ✅ Done                                                                                         |
-| C7      | Advertise append capability                                                                 | C1–C6 pass; supported placements only                  | ✅ Done                                                                                         |
-| F1      | Minimal execution principal, durable audit, quota reservation, enforced tool/sandbox policy | F0; required before W release                          | Foundation primitives present; production enforcement incomplete                                |
-| W1      | Versioned work schema/API and approval-bound lifecycle                                      | F0; creation remains gated                             | Core implemented; gated deployment pending                                                      |
-| W2      | Durable due scheduling, run claims, leases and handoff recovery                             | W1; shared/transfer storage contract                   | Core implemented; deployed handoff acceptance open                                              |
-| W3      | Independent context/state and enforced silent read-only turns                               | W2 + F1                                                | Core implemented, execution OFF; real-adapter isolation acceptance open                         |
-| W4      | Idempotent report, transactional outbox and delivery recovery                               | W3; no universal exactly-once claim                    | Core implemented; current grants, monetary budgets and mandatory audit intent open              |
-| W5      | Management/approval tools and console controls/timeline                                     | W1–W4; pause/cancel and uncertainty visible            | Inspect/actions/history implemented; live lease state and create/edit UI absent                 |
-| W6      | Release fixed-schedule Standing Work                                                        | F1 + W1–W5 acceptance and failure-injection gates      | Not complete; release gates open                                                                |
-| I1      | Full Agent Identity v1 management                                                           | Extend F1; GitHub/service-account lifecycle            | Partial: management present; live revocation/provider binding incomplete                        |
-| A1      | Unified Audit search/export and expanded coverage                                           | Extend F1 and effect events                            | Partial: search/export/recording/flush/UI present; fail-closed intent and broader coverage open |
-| B1      | Full hierarchical budgets, allocation and alerts                                            | Extend F1; strict-cap runtime compatibility            | Not started                                                                                     |
-| W7      | Adaptive scheduling and conversation/webhook wakes                                          | W6; bounded scheduling, budgets and loop tests         | Partial: adaptive and conversation-wake code; integration/loop/interval/webhook gaps            |
-| M1      | Memory scope/provenance and administrative lifecycle                                        | Identity/audience/audit foundations                    | Not started                                                                                     |
-| S1      | Continued sandbox hardening and backend parity                                              | Blockers handled throughout, not deferred here         | Partial (network policy + macOS remain)                                                         |
-| P1      | ACP capability mapping, adapters, migration and deprecation                                 | Preserve identity/audit/budget/isolation contracts     | Not started                                                                                     |
+| Package | Deliverable | Dependencies / exit condition | Status |
+| --- | --- | --- | --- |
+| F0 | Identity/provenance/audience/budget contracts; verified production-blocker inventory | Before autonomous release; use existing infrastructure | Foundation contracts/inventory present; not release certification |
+| C1 | Coordinate plumbing (existing PR1) | No behavior change | ✅ Done |
+| C2 | Config + capability fence (existing PR2) | No capability advertisement | ✅ Done |
+| C3 | Reservation store and monotonic clock | Atomicity and GC tests | ✅ Done |
+| C4 | Physical-thread participation writers/readers | Existing routing preserved; real physical ids | ✅ Done |
+| C5 | Durable coordinates, replay, observation and runtime routing | C1–C4; restart/mode-change tests | ✅ Done |
+| C6 | Reset commands, mode UX, audience and paginated history | C5; complete session acceptance suite | ✅ Done |
+| C7 | Advertise append capability | C1–C6 pass; supported placements only | ✅ Done; release evidence pending |
+| F1 | Minimal execution principal, durable audit, finite quotas, enforced tool/sandbox policy | F0; required before W release | Foundation primitives present; production enforcement incomplete |
+| W1 | Versioned work schema/API and approval-bound lifecycle | F0; creation remains gated | Core implemented |
+| W2 | Durable due scheduling, run claims, leases and handoff recovery | W1; shared/transfer storage contract | Core implemented; deployed handoff evidence open |
+| W3 | Independent context/state and enforced silent read-only turns | W2 + F1 | Core implemented; execution OFF; isolation acceptance open |
+| W4 | Idempotent report, transactional outbox and delivery recovery | W3; no universal exactly-once claim | Core implemented; live authority/policy/audit-intent gates open |
+| W5 | Management/approval tools and console controls/timeline | W1–W4 | Inspect/actions/history implemented; create/edit UX and live lease detail remain |
+| E1 | Module-boundary hardening for store, daemon, Standing Work, CP application layer, and Web data layer | Preserve behavior and deployment topology; add contract mapping tests | Open; architecture refactor, not product redesign |
+| W6.1 | Standing Work contract correctness | Persist/enforce configured intervals; no silent projection field loss | **P0 blocker**: `minIntervalSeconds` daemon persistence/enforcement is incomplete |
+| AUTH1 | Runtime authority closure | Principal/grants checked at create/edit, admission/context, and external effects; disable/revoke reconciles/fences | **P0 blocker** |
+| POL1 | Runtime policy-reference enforcement | Resolve/enforce budget/tool/notification/visibility refs or narrow V1 contract | **P0 blocker** |
+| OPS1 | Production enablement and capability wiring | Explicit CLI/env/deployment config; enabled feature advertises only when executable | **P0 blocker** |
+| REL1 | Failure-injection and release evidence | Crash/takeover/stale executor/revoke/uncertain effect/shared-store/mixed-version suites | **P0 blocker** |
+| W6 | Release fixed-schedule Standing Work V1 | W1–W5 + W6.1 + AUTH1 + POL1 + OPS1 + REL1 | Not complete |
+| I1 | Complete Agent Identity v1 | AUTH1 plus provider binding/token lifecycle | Management implemented; provider/runtime lifecycle incomplete |
+| A1 | Complete Unified Audit enforcement and coverage | Fail-closed effect intent, typed/bounded details, broader tool/process/network/credential coverage | Durable pipeline/search/export/UI implemented; coverage/enforcement open |
+| B1 | Full hierarchical budgets, allocation and alerts | Extend F1/POL1; strict-cap runtime compatibility | Not started |
+| W7 | Adaptive scheduling and conversation/webhook wakes | **After W6**; durable/coalesced wakes, trusted provenance, configured intervals, loop/webhook tests | Experimental/partial; does not block fixed V1 |
+| M1 | Memory scope/provenance and administrative lifecycle | Identity/audience/audit foundations | Not started |
+| S1 | Continued sandbox hardening and backend parity | Blockers handled throughout, not deferred here | Partial (network policy + macOS remain) |
+| P1 | ACP capability mapping, adapters, migration and deprecation | Preserve identity/audit/budget/isolation contracts | Not started |
 
-C1–C7 and the F0/F1 primitives form the committed baseline. The current working
-tree adds W1–W5 core behavior, partial W7 and I1, and partial A1. Do not interpret
-local implementation or a console flag as a production release or a merged change.
+C1–C7 should now be treated as a release-evidence track, not an architectural design track.
+W1–W5 should be preserved and hardened rather than rewritten. The immediate autonomous-work
+sequence is W6.1 → AUTH1 → POL1 → OPS1 → REL1 → W6. E1 can run alongside those packages as
+behavior-preserving modularization, prioritizing `LocalStore`, Standing Work execution,
+`daemon.ts`, and the Web data layer.
 
-Next, close live authority revocation and mandatory durable effect intent, then
-complete fixed-schedule policy enforcement, runtime isolation, handoff and operator
-visibility acceptance. Correct W7 scheduling/wake semantics before exposing them;
-fixed-schedule deployments must reject unsupported adaptive/wake definitions.
-B1 monetary reservation is part of the recorded W6 gates; full budget management,
-broader audit coverage, M1 and P1 can follow their dependencies. See
+Only after fixed V1 is release-ready should W7 adaptive/conversation/webhook wake semantics
+expand. B1 monetary reservation, broader A1 coverage, M1, and P1 continue according to their
+dependencies. See
 [the ordered implementation and validation plan](agentconnect-next-steps.md).
 
-## 12. Non-negotiable invariants
+## 13. Non-negotiable invariants
 
 1. Physical delivery and logical session identity are separate, resolved once before admission.
 2. Durable replay preserves the original admitted identity; resets and edits cannot retarget it.
@@ -616,3 +724,6 @@ broader audit coverage, M1 and P1 can follow their dependencies. See
 8. Conversation visibility, memory scope, and provider permissions are authorization boundaries.
 9. Mixed-version deployments fail closed; capability advertisement follows complete release gates.
 10. Each phase is independently usable; later feature ambition does not bypass current safeguards.
+11. Safety-relevant fields survive every CP/domain/wire/daemon/store mapping; silent field loss is a release failure.
+12. Composition roots compose, persistence modules persist, and application/UI facades do not accumulate unrelated domains indefinitely.
+13. Tool/effect authorization is based on typed capabilities and policy, not naming conventions or model-generated intent.
