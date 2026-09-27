@@ -31,6 +31,8 @@ import {
   PgSessionUsageRepo
 } from '../../src/persistence/index.js'
 import { PgMemberSetRepo } from '../../src/persistence/repositories/member-set.repo.js'
+import { PgStandingWorkRepo } from '../../src/persistence/repositories/standing-work.repo.js'
+import { PgAuditRepo } from '../../src/persistence/repositories/audit.repo.js'
 import { PlaintextSecretCipher } from '../../src/secrets/cipher.js'
 import { EpochService } from '../../src/orchestrator/epoch.js'
 import { DUTY_LEASE_DEFAULTS } from '../../src/orchestrator/dutyLease.js'
@@ -95,6 +97,8 @@ export function buildDaemonApp(prisma: PrismaClient): DaemonApp {
     agentSecret: new PgAgentSecretStore(prisma, cipher),
     assignment: new PgAssignmentRepo(prisma),
     cron: new PgCronRepo(prisma),
+    standingWork: new PgStandingWorkRepo(prisma),
+    audit: new PgAuditRepo(prisma),
     hook: new PgHookRepo(prisma),
     lease: new PgSecretLeaseRepo(prisma),
     integration: new PgIntegrationRepo(prisma),
@@ -174,6 +178,8 @@ export function buildDaemonApp(prisma: PrismaClient): DaemonApp {
         onRegister: () => undefined
       } as unknown as DaemonWsDeps['dutyLease'],
       cron: repos.cron,
+      standingWork: repos.standingWork,
+      audit: repos.audit,
       hook: repos.hook,
       relayRoster: async () => [],
       clock,

@@ -30,6 +30,8 @@ import {
   AgentWakeOk
 } from './frames/agent.js'
 import { CronUpsert, CronRemove, CronReport, CronRunNow } from './frames/cron.js'
+import { StandingWorkControl, StandingWorkRunReport } from './frames/standing-work.js'
+import { AuditFlush, AuditFlushOk } from './frames/audit.js'
 import {
   DutyGrant,
   DutyRenewed,
@@ -297,6 +299,11 @@ export const FRAME_SCHEMAS = {
   'cron/remove': CronRemove,
   'cron/report': CronReport,
   'cron/run': CronRunNow,
+  'standing-work/control': StandingWorkControl,
+  'standing-work/report': StandingWorkRunReport,
+  // ── A1 unified audit: a daemon's durable execution trail, drained in batches (D→C REQ → ok) ──
+  'audit/flush': AuditFlush,
+  'audit/flush/ok': AuditFlushOk,
   // ── hooks (content fires ride rd/*; only metadata/effect control is here) ──
   'hook/report': HookReport,
   'hook/start': HookStart,
@@ -609,6 +616,10 @@ export const AnyFrame = z.discriminatedUnion('type', [
   frame('cron/remove', FRAME_SCHEMAS['cron/remove']),
   frame('cron/report', FRAME_SCHEMAS['cron/report']),
   frame('cron/run', FRAME_SCHEMAS['cron/run']),
+  frame('standing-work/control', FRAME_SCHEMAS['standing-work/control']),
+  frame('standing-work/report', FRAME_SCHEMAS['standing-work/report']),
+  frame('audit/flush', FRAME_SCHEMAS['audit/flush']),
+  frame('audit/flush/ok', FRAME_SCHEMAS['audit/flush/ok']),
   frame('hook/report', FRAME_SCHEMAS['hook/report']),
   frame('hook/start', FRAME_SCHEMAS['hook/start']),
   frame('hook/start/ok', FRAME_SCHEMAS['hook/start/ok']),

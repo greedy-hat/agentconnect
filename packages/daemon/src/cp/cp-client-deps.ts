@@ -17,7 +17,8 @@ import type {
   SessionPullRequestFeedback,
   SessionPullRequestFeedbackResult,
   TaskList,
-  TaskListReq
+  TaskListReq,
+  StandingWorkRunReport
 } from '@agentconnect.md/protocol'
 import { POD_TEMPLATE_HASH_ENV } from '@agentconnect.md/protocol'
 import { ClientTransport, systemClock } from '@agentconnect.md/connection'
@@ -58,6 +59,7 @@ import type { SystemMetrics } from '../metrics/system-metrics.js'
 import type { ReadinessGate } from '../readiness.js'
 import type { MemoryHomePorts } from '../memory/home.js'
 import type { DreamRunner } from '../dream/runner.js'
+import type { StandingWorkControlPlane } from '../execution/standing-work.js'
 import type { ExecutorFacet } from '../execution/executor-facet.js'
 import type { CodeHostNoteProjector } from '../gitlab/note-projection.js'
 
@@ -121,12 +123,16 @@ export interface CpClientReadyHost {
   memoryConnections(): CpMemoryConnectionRegistry | undefined
   replayHookTerminalReports(): Promise<void>
   replayChannelSnapshots(): Promise<void>
+  /** Start (or keep) the background drain of this daemon's execution-audit outbox. */
+  armExecutionAuditFlush(): void
   /** Re-assert every live approval wait: the CP cleared them when this daemon dropped (slack-approval-dm.md §7). */
   replayApprovalActivity(): void
   sessionMetadataOutbox(): SessionMetadataOutbox
   webchatMcpRevocations(): WebchatMcpRevocations
   drainSessionPurges(): Promise<void>
   effectiveAgents(): LoadedAgent[]
+  /** The `standing-work/report` catch-up feed: this daemon's persisted terminal runs, empty while execution is dark. */
+  standingWorkReports(): Promise<StandingWorkRunReport[]>
   /** The §16 run-projection writer: the CP dispatch target and the interrupted-write reconciler. */
   noteProjector(): CodeHostNoteProjector
   /** The §15 review outbox, for the control-plane frames a finished attempt still owes. */
@@ -174,6 +180,10 @@ export interface CpClientSeamHost {
   withWorkspaceFileWrite<T>(agentId: string, write: () => Promise<T>): Promise<T>
   withWorkspaceIndexWrite<T>(agentId: string, write: () => Promise<T>): Promise<T>
   runCommitMessagePass: CommitMessagePass
+  /** Fixed Standing Work control adapter — present only once the daemon owns the durable
+   *  service/pump (shared store + placement + policy backend live). Absent ⇒ the handler
+   *  refuses every `standing-work/control` frame rather than acting on a stale local copy. */
+  standingWorkControl?(): StandingWorkControlPlane | undefined
 }
 
 /** Everything the CP client's dependency literal touches on the `Daemon`. */
@@ -294,6 +304,9 @@ export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
       host.wakeMemoryHomeMigrations()
       await host.replayHookTerminalReports()
       await host.replayChannelSnapshots()
+      // The audit drain is a self-rescheduling loop, so a socket that survives an outage needs no
+      // second trigger — arming an already-armed flusher is a no-op.
+      host.armExecutionAuditFlush()
       // Only snapshots written to the durable outbox by this build are
       // replayed. Historical session rows are never scanned or backfilled.
       // The approval replay follows the drain: a wait for a session whose `start` snapshot is still in
@@ -323,6 +336,9 @@ export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
           if (at !== undefined)
             host.cpClient()?.emitCronReport({ cronId: c.id, agentId: a.id, firedAt: new Date(at).toISOString() })
         }
+      // ...and each standing-work run this daemon executed while the CP was unreachable (same
+      // latest-wins upsert, so re-asserting a report the CP already took is a no-op).
+      for (const report of await host.standingWorkReports()) host.cpClient()?.emitStandingWorkReport(report)
     },
     localState: () => host.cpLocalState(),
     loadSnapshot: (): Heartbeat['load'] => ({
@@ -413,6 +429,9 @@ export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
       : {}),
     // §16 desired projection generations, converged by the only GitLab Notes writer for this surface.
     codeHostNoteProjection: (desired, orgId) => host.noteProjector().apply(desired, orgId),
+    // Fixed Standing Work control: injected only when this daemon runs the durable pump; otherwise
+    // the handler answers `unavailable` and the CP projects nothing (the feature is not advertised).
+    ...(host.standingWorkControl?.() ? { standingWorkControl: host.standingWorkControl!() } : {}),
     // The console's "start this agent's sandbox": duty claim + channel bind, no host — the same
     // condition the file reader serves on, reached without a turn. Local daemons have no plane.
     agentWake: createAgentWaker({

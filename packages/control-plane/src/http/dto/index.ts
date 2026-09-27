@@ -939,6 +939,7 @@ export const IntegrationDto = z.object({
   status: z.string(),
   region: FeishuRegion.optional(), // feishu integrations only: 'feishu' | 'lark' gateway
   createdAt: z.string(), // ISO-8601
+  supportsAppendSessionMode: z.boolean(),
   channels: z.array(IntegrationChannelDto)
 })
 export const IntegrationListDto = z.array(IntegrationDto)
@@ -3973,6 +3974,104 @@ export const UsageDto = z.object({
       })
     )
   })
+})
+
+// ── I1: Principal Identity ──────────────────────────────────────────────────
+export const PrincipalDto = z.object({
+  id: z.string(),
+  orgId: z.string(),
+  name: z.string(),
+  kind: z.enum(['agent', 'service', 'delegated']),
+  agentId: z.string().nullable(),
+  state: z.enum(['active', 'disabled']),
+  disabledAt: z.string().nullable(),
+  disabledBy: z.string().nullable(),
+  authorizationRevision: z.number(),
+  createdByActorId: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string()
+})
+
+export const PrincipalListDto = z.object({ principals: z.array(PrincipalDto) })
+
+export const CreatePrincipalBody = z.object({
+  name: z.string().min(1).max(128),
+  kind: z.enum(['agent', 'service', 'delegated']),
+  agentId: z.string().optional()
+})
+
+export const PrincipalGrantDto = z.object({
+  id: z.string(),
+  orgId: z.string(),
+  principalId: z.string(),
+  resourceType: z.enum(['repo', 'destination', 'tool']),
+  resourceId: z.string(),
+  capability: z.enum(['read', 'comment', 'write', 'execute', 'notify']),
+  expiresAt: z.string().nullable(),
+  revokedAt: z.string().nullable(),
+  revokedBy: z.string().nullable(),
+  createdByActorId: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string()
+})
+
+export const PrincipalGrantListDto = z.object({ grants: z.array(PrincipalGrantDto) })
+
+export const CreatePrincipalGrantBody = z.object({
+  resourceType: z.enum(['repo', 'destination', 'tool']),
+  resourceId: z.string().min(1),
+  capability: z.enum(['read', 'comment', 'write', 'execute', 'notify']),
+  expiresAt: z.string().datetime().optional()
+})
+
+// ── A1: Unified Audit ───────────────────────────────────────────────────────
+// `kind` is a plain string (not a locked enum) so a new AuditKind added by the
+// daemon execution trail (Phase 4) reads back without a DTO edit; Prisma's enum
+// is the real constraint on write. `id`/`nextCursor` are BigInt → serialized as
+// decimal strings (Fastify cannot JSON-encode a BigInt).
+export const AuditEventDto = z.object({
+  id: z.string(),
+  kind: z.string(),
+  orgId: z.string().nullable(),
+  daemonId: z.string().nullable(),
+  agentId: z.string().nullable(),
+  sessionId: z.string().nullable(),
+  actorUserId: z.string().nullable(),
+  message: z.string().nullable(),
+  details: z.unknown(),
+  eventId: z.string().nullable(),
+  traceId: z.string().nullable(),
+  parentEventId: z.string().nullable(),
+  effectId: z.string().nullable(),
+  principalId: z.string().nullable(),
+  source: z.enum(['cp', 'daemon']),
+  occurredAt: z.string().nullable(),
+  createdAt: z.string()
+})
+
+export const AuditSearchQuery = z.object({
+  kinds: z.string().optional(), // comma-separated AuditKind values
+  principalId: z.string().optional(),
+  traceId: z.string().optional(),
+  effectId: z.string().optional(),
+  agentId: z.string().optional(),
+  daemonId: z.string().optional(),
+  sessionId: z.string().optional(),
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  cursor: z.string().regex(/^\d+$/).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional()
+})
+
+export const AuditSearchResponseDto = z.object({
+  events: z.array(AuditEventDto),
+  nextCursor: z.string().nullable()
+})
+
+export const AuditExportResponseDto = z.object({
+  events: z.array(AuditEventDto),
+  truncated: z.boolean(),
+  exportedAt: z.string()
 })
 
 // ── shared ────────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { createMemoryEntryService } from '../memory/entries/factory.js'
 import { memoryActivationContext } from '../memory/entries/activation.js'
 import type { ContentBlock, McpServer } from '@agentclientprotocol/sdk'
-import { LocalStore, sessionKey, transcriptChannelKey, type TranscriptEntry } from '../store/local-store.js'
+import { LocalStore, transcriptChannelKey, type TranscriptEntry } from '../store/local-store.js'
 import { isSyntheticA2aChannel } from '../cp/cp-collab-routes.js'
 import { monotonicTs } from '../store/monotonic-ts.js'
 import { effectiveSessionIsolation, WorkspaceManager } from '../workspace/workspace-manager.js'
@@ -27,6 +27,7 @@ import { ingestInboundTranscript } from './turn/transcript-ingest.js'
 import { matchSkillInvocation, renderSkillInvocation } from './skill-invocation.js'
 import type { RuntimeCommand } from '@agentconnect.md/protocol'
 import { deriveTitle } from './derive-title.js'
+import { currentSessionCoordinates, sessionKeyForCoordinates, type SessionCoordinates } from './session-coordinate.js'
 
 // The recall lifecycle contract lives with the collaborator that emits it; re-exported
 // here because SessionManagerDeps is the seam production wires its observer through.
@@ -329,6 +330,8 @@ export class SessionManager {
     /** A self-authored channel-root post only establishes the new logical/runtime session.
      *  It is already recorded in the transcript and must not become a model activation. */
     options: {
+      /** Resolved at admission. Optional only for direct SessionManager callers retained in tests. */
+      coordinates?: SessionCoordinates
       initializeOnly?: boolean
       /** True only when the daemon attached trusted CallMeta for this turn.
        * `source: agent` alone is insufficient: background-task and orchestration
@@ -380,7 +383,8 @@ export class SessionManager {
     // agent, else the agent-level store (#653). Reused for seeding, injection, and
     // recall so all three hit the same store.
     const memScope = this.deps.memoryScopeFor?.(agentId, msg, integrationId) ?? { agentId }
-    const { thread, ts: coordTs } = transcriptCoords(msg)
+    const coordinates = options.coordinates ?? currentSessionCoordinates(msg)
+    const { thread, ts: coordTs } = transcriptCoords(msg, coordinates)
     // webchat's msgId is stable per-conversation, so transcriptCoords yields the SAME ts
     // for every turn — the transcript's (channel,thread,ts) unique index would then dedup
     // every follow-up user message (only the first turn is ever recorded). Prefer the
@@ -392,7 +396,7 @@ export class SessionManager {
     // whole conversation is recorded, and thread stays stable → one session.
     let ts = msg.platform === 'webchat' ? (msg.transcriptTs ?? monotonicTs()) : coordTs
     const transportScope = msg.transportScope
-    const key = sessionKey(msg.platform, msg.channel, thread, agentId, transportScope)
+    const key = sessionKeyForCoordinates(agentId, msg, coordinates)
     let rec = await this.deps.store.getSession(key)
     const transcriptChannel = transcriptChannelKey(msg.channel, transportScope)
 
@@ -975,8 +979,11 @@ export class SessionManager {
  *  BOTH the session manager and the daemon's unrouted-append path so a message
  *  recorded from either site lands on the same (thread, ts) PK and dedups via
  *  INSERT OR IGNORE — never a divergent double row. */
-export function transcriptCoords(msg: NormalizedMessage): { thread: string; ts: string } {
-  const thread = msg.thread ?? msg.msgId
+export function transcriptCoords(
+  msg: NormalizedMessage,
+  coordinates: Pick<SessionCoordinates, 'sessionThread'> = currentSessionCoordinates(msg)
+): { thread: string; ts: string } {
+  const thread = coordinates.sessionThread
   if (msg.transcriptTs) return { thread, ts: msg.transcriptTs }
   // NormalizedMessage.msgId is `slack:<channel>:<ts>`; recover the ts.
   const parts = msg.msgId.split(':')

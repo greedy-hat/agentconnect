@@ -342,6 +342,34 @@ describe('IntegrationChannelList trigger control', () => {
   })
 })
 
+describe('IntegrationChannelList session control', () => {
+  const render = (kind: IntegrationChannelRow['kind'], sessionMode: 'createNew' | 'append' = 'createNew') =>
+    renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        platform: 'slack',
+        gated: false,
+        channels: [{ channelId: 'C1', name: 'deploys', kind, trigger: 'mention', sessionMode }]
+      })
+    )
+
+  it('shows per-thread and continuous choices for a channel', () => {
+    const html = render('channel')
+    expect(html).toContain('Session for deploys')
+    expect(html).toContain('Per thread')
+    expect(html).toContain('Continuous')
+    expect(html).toContain('upgrade required')
+  })
+
+  it('preserves the configured append selection even before the daemon upgrade', () => {
+    expect(render('channel', 'append')).toMatch(/<option[^>]*value="append"[^>]*selected=""/)
+  })
+
+  it('does not expose the control for direct conversations', () => {
+    expect(render('im')).not.toContain('Session for')
+    expect(render('mpim')).not.toContain('Session for')
+  })
+})
+
 describe('rowLabel', () => {
   it('strips the stored @ from a direct conversation and leaves a channel alone', () => {
     expect(rowLabel({ kind: 'im', name: '@Alice' })).toBe('Alice')

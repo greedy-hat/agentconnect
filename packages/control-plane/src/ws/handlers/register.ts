@@ -29,6 +29,7 @@ import {
   SESSION_EXECUTORS_V1_FEATURE,
   SESSION_LIVE_TAIL_FEATURE,
   SESSION_METADATA_ACK_FEATURE,
+  EXECUTION_AUDIT_V1_FEATURE,
   SESSION_PURGE_FEATURE,
   SESSION_VISIBILITY_FEATURE
 } from '@agentconnect.md/protocol'
@@ -119,6 +120,9 @@ export const handleRegister: Handler = async (frame, conn, deps) => {
       'agent-directory-org-scope-v1',
       SESSION_LIVE_TAIL_FEATURE,
       SESSION_METADATA_ACK_FEATURE,
+      // A1: this CP ingests the daemon execution trail over `audit/flush`. A daemon that does not
+      // see it keeps its audit rows queued instead of sending a frame an older CP cannot decode.
+      EXECUTION_AUDIT_V1_FEATURE,
       SESSION_PURGE_FEATURE,
       SESSION_VISIBILITY_FEATURE,
       ORGANIZATION_KNOWLEDGE_FEATURE,

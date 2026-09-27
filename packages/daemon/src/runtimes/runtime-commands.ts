@@ -75,7 +75,10 @@ export const internalPassSlot = {
   commit: (agentId: string, sessionId: string) => `commit:${agentId}:${sessionId}`,
   /** Per agent, not per dream: a dream can fail before the discard in its own finally, and its
    *  dedicated host keeps it out of the gate whether or not this entry is current. */
-  dream: (agentId: string) => `dream:${agentId}`
+  dream: (agentId: string) => `dream:${agentId}`,
+  /** One agent's scheduled ambient turns are serialized by the pump, but the slot is per-session so a
+   *  canceled turn's straggler cannot collide with the next occurrence's advertisement. */
+  standingWork: (agentId: string, sessionId: string) => `standing-work:${agentId}:${sessionId}`
 }
 
 /** The ACP sessions the daemon opens for its OWN passes — distillation, the commit-message wand, a

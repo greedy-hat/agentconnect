@@ -35,7 +35,8 @@ import type {
   SessionVisibilityPush,
   DutyGrantEntry,
   DutyRevoke,
-  GitCommitIdentity
+  GitCommitIdentity,
+  StandingWorkProjection
 } from '@agentconnect.md/protocol'
 import type { Clock } from '@agentconnect.md/connection'
 import { mergeConfigPush, type ConfigApply } from './config-apply.js'
@@ -91,6 +92,8 @@ export interface ConfigApplyRegistryHost {
   cpCollab(): CpCollabRoutes
   cpMcpDefs(): CpMcpDefs | undefined
   memoryConnections(): CpMemoryConnectionRegistry | undefined
+  /** Reconcile the register/ok CP standing-work projections into the durable execution core. */
+  ingestStandingWorks(projections: StandingWorkProjection[]): Promise<void>
   convergeRelays(relays: RelayRosterEntry[]): void
   onMcpDefsChanged(): void
   /** Prune every CP dependent of an agent that is absent from the given exact set. */
@@ -297,6 +300,17 @@ export async function applyReconcileSnapshot(host: ConfigApplyHost, snap: Regist
   for (const id of snap.drop.crons) host.cpCrons()?.remove(id)
   const desiredCrons = (snap.crons ?? []).filter((cron) => !host.moveStagedAgents().has(cron.agentId))
   host.cpCrons()?.converge(desiredCrons)
+  // Standing-work durable projections AFTER agents + crons.  Creation has no live control frame, so
+  // this snapshot is the daemon's only feed for a newly-created objective; lifecycle decisions still
+  // ride `standing-work/control`.  A single malformed projection must not abandon the rest of the
+  // reconnect, so each is converged independently and a failure is logged, not thrown.
+  for (const projection of snap.standingWorks ?? []) {
+    try {
+      await host.ingestStandingWorks([projection])
+    } catch (err) {
+      host.log().warn(`cp: standing work "${projection.workId}" projection failed to land (${formatErr(err)})`)
+    }
+  }
   for (const { agentId } of revivableAgents) {
     if (!rewrittenAgents.has(agentId)) continue
     if (host.removedAgentTombstones().has(agentId) || host.cpDroppedAgents().has(agentId)) {

@@ -152,6 +152,43 @@ describe('openapi plane', () => {
     }
   })
 
+  it('names every Standing Work route the console inspects and stops', async () => {
+    const app = await buildReady()
+    try {
+      const doc = (await app.inject({ method: 'GET', url: '/api/v1/openapi.json' })).json() as Record<string, any>
+      const base = '/api/v1/orgs/{orgId}/standing-work'
+      // A docs UI renders only the bare path without a name and a group, so each of these is the
+      // route W5's console calls — the read pair, the run timeline, and the fenced lifecycle writes.
+      const expected: Array<[string, string, 'get' | 'post' | 'put']> = [
+        [base, 'createStandingWork', 'post'],
+        [base, 'listStandingWork', 'get'],
+        [`${base}/{id}`, 'getStandingWork', 'get'],
+        [`${base}/{id}/runs`, 'listStandingWorkRuns', 'get'],
+        [`${base}/{id}`, 'replaceStandingWork', 'put'],
+        [`${base}/{id}/approve`, 'approveStandingWork', 'post'],
+        [`${base}/{id}/pause`, 'pauseStandingWork', 'post'],
+        [`${base}/{id}/resume`, 'resumeStandingWork', 'post'],
+        [`${base}/{id}/cancel`, 'cancelStandingWork', 'post']
+      ]
+      for (const [path, operationId, method] of expected) {
+        const op = doc.paths?.[path]?.[method]
+        expect(op, `${method} ${path}`).toMatchObject({ tags: ['Standing work'], operationId })
+        expect(op?.summary, path).toBeTruthy()
+        expect(op?.description, path).toBeTruthy()
+      }
+      expect((doc.tags ?? []).map((t: any) => t.name)).toContain('Standing work')
+
+      // The timeline's page size is documented, or a docs client fetches the whole history by
+      // accident — and the read that only inspects must not offer a write status code.
+      const runs = doc.paths?.[`${base}/{id}/runs`]?.get
+      expect((runs?.parameters ?? []).map((p: any) => p.name)).toContain('limit')
+      expect(Object.keys(runs?.responses ?? {})).toEqual(expect.arrayContaining(['200', '404']))
+      expect(runs?.responses?.['403']).toBeUndefined()
+    } finally {
+      await app.close()
+    }
+  })
+
   it('excludes non-public surfaces (/health) from the spec', async () => {
     const app = await buildReady()
     try {

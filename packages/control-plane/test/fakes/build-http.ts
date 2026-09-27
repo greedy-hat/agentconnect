@@ -9,6 +9,7 @@
  */
 import type { FastifyInstance } from 'fastify'
 import type { PrismaClient } from '../../src/generated/prisma/client.js'
+import { PgStandingWorkRepo } from '../../src/persistence/repositories/standing-work.repo.js'
 import {
   PgAgentRepo,
   PgAssignmentRepo,
@@ -45,6 +46,7 @@ import {
   PgOrgRepo,
   PgOrgInviteLinkRepo,
   PgWaitlistRepo,
+  PgPrincipalRepo,
   PgIntegrationRepo,
   PgBotRepo,
   PgBotSecretStore,
@@ -94,6 +96,7 @@ import { WebchatMcpGrantTokenCodec } from '../../src/registry/webchatMcpGrantTok
 import { OrgInviteLinkCodec } from '../../src/registry/orgInviteLink.js'
 import { OrgInviteLinkService } from '../../src/registry/orgInviteLinkService.js'
 import { WaitlistService } from '../../src/registry/waitlistService.js'
+import { PrincipalService } from '../../src/registry/principalService.js'
 import { EpochService } from '../../src/orchestrator/epoch.js'
 import { DUTY_LEASE_DEFAULTS } from '../../src/orchestrator/dutyLease.js'
 import { ControlSender } from '../../src/orchestrator/outbound.js'
@@ -277,6 +280,8 @@ export function buildHttpApp(
   )
   const waitlistRepo = new PgWaitlistRepo(prisma)
   const waitlist = new WaitlistService(TEST_API_KEY_PEPPER, waitlistRepo, clock)
+  const principalRepo = new PgPrincipalRepo(prisma)
+  const principals = new PrincipalService(principalRepo, auditRepo, clock)
 
   const events = new InMemorySessionEventSink()
 
@@ -378,7 +383,13 @@ export function buildHttpApp(
     hookRepo,
     giteaSeam?.api.baseUrl
   )
-  const agentDelivery = new AgentDelivery({ control: sender, specs: agentSpecs, placement: placementResolver })
+  const agentDelivery = new AgentDelivery({
+    control: sender,
+    specs: agentSpecs,
+    placement: placementResolver,
+    daemonFeatures: (daemonId) =>
+      (liveness.get(daemonId) as { capabilities?: { features: string[] } } | undefined)?.capabilities?.features
+  })
 
   // LATE-BOUND exactly as `buildContainer` binds it (§9): the providers below are
   // constructed WITH this dep bundle, because their funnel plugins are route
@@ -480,6 +491,7 @@ export function buildHttpApp(
       dutyGroup: dutyGroupRepo,
       daemonLifecycleOp: daemonLifecycleOpRepo,
       cron: new PgCronRepo(prisma),
+      standingWork: new PgStandingWorkRepo(prisma),
       hook: hookRepo,
       hookSecret: hookSecretStore,
       relay: new PgRelayRepo(prisma),
@@ -589,6 +601,7 @@ export function buildHttpApp(
     webchatTokens: new WebchatTokenService(TEST_API_KEY_PEPPER),
     inviteLinks,
     waitlist,
+    principals,
     usageWriter: new SessionUsageWriter(sessionUsageRepo),
     events,
     mcpRateLimit: new McpRateLimiter(clock),

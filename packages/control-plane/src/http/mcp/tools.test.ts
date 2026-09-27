@@ -49,6 +49,8 @@ function recordingCtx(): { ctx: McpToolCtx; calls: RecordedCall[] } {
 
 const CRON_ID = '7b1f9df2-9f63-4a2e-a2d4-3a1a55f5f001'
 const AGENT_UUID = '5e0f8a25-31c8-4a1a-bb0e-9a8f6a2b1c22'
+const WORK_UUID = '4d2c1b0a-0a1b-42c3-9d4e-5f6a7b8c9d0e'
+const DESTINATION = { platform: 'slack', integrationId: AGENT_UUID, channel: 'C123' }
 
 /** Minimal happy-path args per tool (tools with no args pass {}). */
 const ARGS: Record<string, Record<string, unknown>> = {
@@ -86,7 +88,27 @@ const ARGS: Record<string, Record<string, unknown>> = {
   runCron: { cronId: 'cron-1' },
   deleteCron: { cronId: 'cron-1', confirm: 'my-agent' },
   setChannelTrigger: { integrationId: 'integ-1', channelId: 'C123', trigger: 'any' },
-  removeIntegration: { integrationId: 'integ-1', confirm: 'my-agent' }
+  removeIntegration: { integrationId: 'integ-1', confirm: 'my-agent' },
+  getStandingWork: { workId: WORK_UUID },
+  listStandingWorkRuns: { workId: WORK_UUID },
+  createStandingWork: {
+    agentId: AGENT_UUID,
+    name: 'my-agent',
+    objective: 'check prod health and report only what changed',
+    schedule: '0 9 * * *',
+    timezone: 'Asia/Shanghai',
+    startAt: '2026-01-01T00:00:00.000Z',
+    expiresAt: '2026-12-31T00:00:00.000Z',
+    targetDestination: DESTINATION,
+    budgetPolicyRef: 'budget:default',
+    toolPolicyRef: 'tools:read-only',
+    notificationPolicy: { mode: 'changes', includeCompletion: false },
+    visibilityPolicyRef: 'visibility:org'
+  },
+  pauseStandingWork: { workId: WORK_UUID, expectedVersion: 1 },
+  resumeStandingWork: { workId: WORK_UUID, expectedVersion: 1 },
+  approveStandingWork: { workId: WORK_UUID, expectedVersion: 1 },
+  cancelStandingWork: { workId: WORK_UUID, expectedVersion: 1, confirm: 'my-agent' }
 }
 
 async function run(toolName: string, args?: Record<string, unknown>) {

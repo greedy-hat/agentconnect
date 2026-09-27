@@ -4,6 +4,8 @@ import {
   MEMORY_ENTRIES_SEARCH_V1_FEATURE,
   MEMORY_ENTRIES_HISTORY_V1_FEATURE,
   MEMORY_ENTRIES_WRITE_V1_FEATURE,
+  CONVERSATION_SESSION_MODE_V1_FEATURE,
+  STANDING_WORK_FIXED_V1_FEATURE,
   AgentActivate as AgentActivateSchema,
   AgentSkillEntry as AgentSkillEntrySchema,
   WEBCHAT_MULTI_AGENT_FEATURE,
@@ -143,6 +145,12 @@ import {
   slackTsForWallClock,
   quotedSourceBlock
 } from './session/session-manager.js'
+import {
+  currentSessionCoordinates,
+  resolveSessionCoordinates,
+  sessionKeyForCoordinates,
+  type SessionCoordinates
+} from './session/session-coordinate.js'
 import { clampRuntimeTitle, isPromptEchoTitle, promptEchoPrefix } from './session/derive-title.js'
 import {
   ThreadContextCoordinator,
@@ -263,6 +271,7 @@ import { splitIntoSections } from './slack/formatter.js'
 import {
   integrationConfig,
   integrationCore,
+  integrationSessionMode,
   platformIds,
   platformIntegrationConfig
 } from './platforms/integration-config.js'
@@ -398,6 +407,20 @@ import { startK8sRuntimePlane, type K8sRuntimePlane } from './k8s/runtime-plane.
 import { wireWorkspacePlane, type ExecutionPlane, type PlaneLaunch } from './execution/plane.js'
 import { seedSessionHome, startExecutorFacet, type ExecutorFacet } from './execution/executor-facet.js'
 import { effectiveStrategies } from './execution/strategies.js'
+import { DaemonAuditRecorder } from './execution/audit-recorder.js'
+import { ExecutionAuditFlusher } from './execution/audit-flush.js'
+import {
+  StandingWorkAmbientExecutor,
+  StandingWorkControlPlane,
+  StandingWorkGatewayDestinationResolver,
+  StandingWorkMessageDispatcher,
+  StandingWorkPump,
+  StandingWorkService,
+  StandingWorkWakeCoordinator,
+  standingWorkReportCatchup,
+  type AmbientTurnRunner,
+  type StandingWorkContextReader
+} from './execution/standing-work.js'
 import {
   declaredRuntimeCatalog,
   loadK8sRuntimeTable,
@@ -605,7 +628,9 @@ import type {
   McpAppRpc,
   McpAppRpcResult,
   CodeHostProvider,
-  McpAppOutcome
+  McpAppOutcome,
+  StandingWorkProjection,
+  StandingWorkRunReport
 } from '@agentconnect.md/protocol'
 import { boundedDiagnostic, formatErr, startFailureDetail } from './daemon/text.js'
 import { isBuiltinSystemToolCall, type ApprovalRequestParts } from './daemon/tool-classification.js'
@@ -884,6 +909,9 @@ export class Daemon {
   private commitMessageDirs = new Map<string, string>()
   /** The quarantine key of an agent's LAST commit-message pass, so presses don't accumulate one. */
   private commitMessageTombstones = new Map<string, string>()
+  /** Throwaway empty cwd per agent for an ambient standing-work turn (a silent, read-only pass). */
+  /** The quarantine key of an agent's LAST ambient standing-work turn, so runs don't accumulate one. */
+  private standingWorkTombstones = new Set<string>()
   /** Host instances that failed the trusted/read-only preflight; retry only after host replacement. */
   private memoryExtractionUnavailable = new WeakSet<AcpHost>()
   /** Lazily-built dream-job engine (docs/designs/memory-dreaming.md §4). */
@@ -1154,6 +1182,14 @@ export class Daemon {
   // Grant admission, install, and the platform convergence a duty change needs — the timing-critical
   // half of the lease path, with its own in-flight state (cp/duty-coordinator.ts).
   private readonly dutyCoordinator = new DutyCoordinator(this.dutyHost())
+  // Fixed Standing Work. The control adapter is always live once the store is open: the daemon
+  // applies the CP's fenced lifecycle decisions (approve/pause/resume/cancel) over its durable
+  // rows. The executing pump is constructed ONLY when the shared-store + isolated read-only
+  // session prerequisites are met; while it is absent the feature is not advertised and the CP
+  // projects no definitions, so the daemon fails closed rather than half-running autonomous work.
+  private standingWorkControl?: StandingWorkControlPlane
+  private standingWorkPump?: StandingWorkPump
+  private standingWorkWakeCoordinator?: StandingWorkWakeCoordinator
   // ACP permission + elicitation policy and its pending human-approval state (permissions/coordinator.ts).
   private readonly permissions = new PermissionCoordinator(this.permissionHost())
 
@@ -1425,6 +1461,9 @@ export class Daemon {
   // The durable session-metadata outbox (store/session-metadata-outbox.ts); owns its
   // own drain promise and retry timer behind the delegates below.
   private readonly sessionMetadataOutbox: SessionMetadataOutbox
+  // The A1 execution-audit outbox drain (execution/audit-flush.ts). Gated OFF: inert until the operator
+  // opts in, and silent while the connected control plane does not advertise the feature.
+  private readonly executionAuditFlusher: ExecutionAuditFlusher
   // Observed-channel discovery/retraction (platforms/observed-channels-sync.ts).
   private readonly observedChannelsSync: ObservedChannelsSync
   private readonly webchatTransport: WebchatTransport
@@ -1465,6 +1504,17 @@ export class Daemon {
       /** Explicit test/evaluation-only Dream bypass. It is honored only with an
        * injected hostFactory, never by the production CLI/config surface. */
       dreamOperationPolicy?: DreamOperationPolicy
+      /** Operator opt-in to run the fixed Standing Work executing pump. Default OFF: while absent the
+       * daemon applies CP lifecycle decisions but never sweeps due occurrences, never runs ambient
+       * turns, and does not advertise `standing-work-fixed-v1` — so the feature stays dark until the
+       * definition-ingestion boundary (W1) and the operator timeline (W5) are in place. A test may set
+       * it with an injected hostFactory to exercise the ambient runner. */
+      standingWorkExecution?: boolean
+      /** Operator opt-in to write execution-audit events into the durable local outbox. Default OFF: while
+       *  absent the autonomous paths record nothing at all. It only ever produces rows where work is also
+       *  being executed, i.e. together with {@link standingWorkExecution} — a daemon that never sweeps has
+       *  nothing to audit. */
+      executionAudit?: boolean
       /** Time seam for the idle sweep + cancel backstop (FakeClock in tests). */
       clock?: Clock
       /** How the daemon exits for daemon/restart + daemon/upgrade (spied in tests). */
@@ -1553,6 +1603,16 @@ export class Daemon {
     this.claudeModelAliases = this.k8s ? configuredClaudeModelAliases(process.env) : undefined
     this.evalHooks = new DaemonEvaluationHooks(this.evaluationHost(), opts.evaluation)
     this.sessionMetadataOutbox = new SessionMetadataOutbox(this.sessionMetadataHost())
+    this.executionAuditFlusher = new ExecutionAuditFlusher({
+      source: () => this.store,
+      channel: () => this.cpClient,
+      clock: () => this.clock,
+      enabled: () => this.executionAuditAllowed(),
+      draining: () => this.draining,
+      servingAgentIds: () => [...this.agents.keys()].filter((agentId) => this.servesAgent(agentId)),
+      warn: (message) => this.log.warn(message),
+      debug: (message) => this.log.debug(message)
+    })
     this.observedChannelsSync = new ObservedChannelsSync(this.observedChannelsSyncHost())
     this.connections = new ConnectionReconciler(this.connectionReconcilerHost())
     this.webchatTransport = new WebchatTransport(this.webchatHost())
@@ -1665,6 +1725,8 @@ export class Daemon {
     return {
       log: () => this.log,
       store: () => this.store,
+      resolveSessionCoordinates: (agentId, msg, integrationId) =>
+        this.sessionCoordinatesFor(agentId, msg, integrationId),
       agents: () => this.agents,
       pending: () => this.pending,
       inflight: () => this.inflight,
@@ -2629,6 +2691,9 @@ export class Daemon {
   /** Phase 16 — the local (or data-plane) store plus the one rule table every row retention runs from. */
   private async openStoreAndRetention(root: string): Promise<void> {
     this.store = this.dataPlane?.store ?? (await LocalStore.open(statePath(root)))
+    // The lifecycle adapter needs only the durable store, so it is always available here. The
+    // executing pump is deliberately not started at this phase — see the field's comment.
+    this.standingWorkControl = new StandingWorkControlPlane(new StandingWorkService(this.store))
     for (const agent of this.fileAgents.values()) {
       for (const integration of agent.integrations) {
         await this.store.setIntegrationRemoved(agent.id, integration.id, false)
@@ -3549,6 +3614,8 @@ export class Daemon {
     if (!this.k8s) startControlPlane(root)
     this.armIdleSweep()
     this.armStoreRetentionSweep()
+    // Fixed Standing Work execution — dark unless the operator opted in (see armStandingWorkPump).
+    this.armStandingWorkPump()
     this.startupComplete = true
     this.readiness?.refresh()
     this.log.info('daemon ready')
@@ -5442,6 +5509,13 @@ export class Daemon {
       ...(this.dreamOperationsAllowed() ? [ORGANIZATION_SUGGESTION_REVIEW_FEATURE] : []),
       SESSION_VISIBILITY_FEATURE,
       SLACK_SESSION_AUDIENCE_FEATURE,
+      // Append-mode coordinate admission, durable replay, reset CAS, and physical
+      // thread affinity are all daemon-owned and present in this release.
+      CONVERSATION_SESSION_MODE_V1_FEATURE,
+      // Advertised ONLY while this member actually runs the durable fixed-schedule pump (shared
+      // store + isolated read-only execution + policy backend live). Unadvertised ⇒ the CP ships
+      // no Standing Work definitions and refuses lifecycle frames: mixed/unknown peers fail closed.
+      ...(this.standingWorkPump ? [STANDING_WORK_FIXED_V1_FEATURE] : []),
       // This daemon persists the greatest applied AgentSpec.configRevision and
       // refuses an older or contradicting snapshot (organization-secrets-and-
       // variables.md §7). The CP gates placement of an agent bound to an
@@ -6052,6 +6126,254 @@ export class Daemon {
     if (prior && prior !== key) this.memoryExtractionQuarantines.delete(prior)
     this.commitMessageTombstones.set(agentId, key)
     this.memoryExtractionQuarantines.set(key, agentId)
+  }
+
+  /** Keep a detached callback quarantined until its dedicated host is stopped. */
+  private retainStandingWorkTombstone(agentId: string, key: string): void {
+    this.standingWorkTombstones.add(key)
+    this.memoryExtractionQuarantines.set(key, agentId)
+  }
+
+  /**
+   * One silent, read-only ambient turn for a fixed Standing Work occurrence (design:
+   * standing-work W3). Shape is inherited from the two extraction passes it mirrors:
+   * - **Silent**: a collector with no `sessionKey` and no `transcript`, so the whole turn produces zero
+   *   store rows, zero platform delivery and zero evaluation telemetry. The sole external effect of a
+   *   standing check is the notification outbox, never this turn's own output.
+   * - **No MCP tools** (`newSession(cwd, [], …)`) plus `CLAUDE_HEADLESS_DISALLOWED_TOOLS`; the runtime's
+   *   built-in tools can't be removed over ACP, so the verified non-mutating mode below is the hard
+   *   gate that neuters them — the same fail-closed rule the dream and commit pass enforce.
+   * - **Dedicated host**: a fresh sandboxed host excludes agent tool credentials and is torn down
+   *   after the turn. A missing sandbox prevents admission.
+   *
+   * Every failure throws; the pump treats a thrown turn as a fenced, non-committed attempt whose lease
+   * simply expires. The pump — and so this path — is dark unless {@link standingWorkExecutionAllowed}.
+   */
+  private async runStandingWorkAmbientTurn(
+    agentId: string,
+    systemPrompt: string,
+    prompt: string,
+    signal: AbortSignal
+  ): Promise<{ output: string }> {
+    const agent = this.agents.get(agentId)
+    if (!agent) throw new Error(`unknown agent ${agentId}`)
+    if (signal.aborted) throw new Error('ambient standing-work turn canceled before dispatch')
+    if (!this.agentRunsInSandbox(agent)) throw new Error('standing work requires an available sandbox')
+    const cwd = await mkdtemp(join(tmpdir(), 'agentconnect-standing-work-'))
+    const owner = this.dreamOwnerKey(agentId, randomUUID())
+    let issued: { target: ModelProviderTarget; grant: KeyGrant } | undefined
+    let host: AcpHost | undefined
+    let pendingKey: string | undefined
+    try {
+      if (this.modelSessions.enabled) {
+        const runtime = this.runtimes[agent.runtime]
+        const target = runtime ? modelProviderTarget(agent, runtime) : undefined
+        if (!target) throw new Error(`runtime "${agent.runtime}" does not support MODEL_TOKEN translation`)
+        issued = {
+          target,
+          grant: await this.modelSessions.issueKey(
+            agent,
+            target,
+            internalSessionKey.standingWork(agentId, randomUUID())
+          )
+        }
+      }
+      host = await this.buildDreamHost(agent, cwd, owner, issued)
+      const activeHost = host
+      const trusted = host.usesMetaSystemPrompt()
+      // HARD GATE, fail closed: no verified non-mutating mode ⇒ no ambient run with write access.
+      const readOnlyMode = readOnlyExtractionMode(host.permissionModeOptions()?.modes ?? [])
+      if (!readOnlyMode) throw new Error('runtime lacks a verified read-only/plan mode')
+      const sessionId = trusted
+        ? await host.newSession(cwd, [], undefined, systemPrompt, [], undefined, CLAUDE_HEADLESS_DISALLOWED_TOOLS)
+        : await host.newSession(cwd, [], undefined, undefined, [], undefined, CLAUDE_HEADLESS_DISALLOWED_TOOLS)
+      const key = pendingTurnKey(owner, sessionId)
+      pendingKey = key
+      this.internalPassSessions.add(internalPassSlot.standingWork(agentId, sessionId), key)
+      try {
+        if (!(await host.setSessionPermissionMode(sessionId, readOnlyMode))) {
+          throw new Error('runtime rejected the read-only/plan mode')
+        }
+        if (signal.aborted) throw new Error('ambient standing-work turn canceled before dispatch')
+        const onAbort = () => void activeHost.cancel(sessionId).catch(() => {})
+        if (signal.aborted) onAbort()
+        else signal.addEventListener('abort', onAbort, { once: true })
+        const chunks: string[] = []
+        this.memoryExtractionQuarantines.delete(key)
+        this.memoryExtractionCollectors.set(key, { chunks, builtinSystemToolCallIds: new Set() })
+        try {
+          const text = trusted ? prompt : `${systemPrompt}\n\n${prompt}`
+          await this.promptWithCancelBackstop(
+            host,
+            sessionId,
+            text,
+            signal,
+            (detached) => {
+              this.memoryExtractionCollectors.delete(key)
+              this.retainStandingWorkTombstone(agentId, key)
+              void detached.catch(() => {})
+            },
+            'ambient standing-work turn'
+          )
+          return { output: chunks.join('') }
+        } finally {
+          signal.removeEventListener('abort', onAbort)
+          this.retainStandingWorkTombstone(agentId, key)
+          this.memoryExtractionCollectors.delete(key)
+        }
+      } finally {
+        host.discardSession(sessionId)
+        this.internalPassSessions.delete(key)
+      }
+    } finally {
+      await host?.stop().catch(() => {})
+      await this.microsandbox
+        ?.discard(`${agent.id}/${hostKeyDirName(owner)}`)
+        .then(() => rm(join(agent.dir, 'runtime-homes', hostKeyDirName(owner)), { recursive: true, force: true }))
+        .catch((error: unknown) =>
+          this.log.warn(`microsandbox: could not discard standing-work VM (${formatErr(error)})`)
+        )
+      removeHostSandboxState(agent.dir, owner)
+      if (issued) await this.modelSessions.revokeKeyQuietly(issued.grant.keyId)
+      await rm(cwd, { recursive: true, force: true })
+      if (pendingKey) {
+        this.memoryExtractionQuarantines.delete(pendingKey)
+        this.standingWorkTombstones.delete(pendingKey)
+      }
+    }
+  }
+
+  /** The daemon's AmbientTurnRunner: the durable executor depends only on this narrow seam, so the
+   *  security-critical session machinery stays in one reviewed method while the pump stays testable. */
+  private standingWorkAmbientRunner(): AmbientTurnRunner {
+    return {
+      run: ({ agentId, systemPrompt, prompt, signal }) =>
+        this.runStandingWorkAmbientTurn(agentId, systemPrompt, prompt, signal)
+    }
+  }
+
+  /** Read only the bounded text this Agent actually received or produced on the authorized source. */
+  private standingWorkContextReader(): StandingWorkContextReader {
+    return {
+      read: async ({ work, afterCursor, limit }) => {
+        let ref: { platform: string; integrationId: string; channel: string; thread?: string }
+        try {
+          const parsed = JSON.parse(work.conversationRefJson ?? 'null') as unknown
+          if (!parsed || typeof parsed !== 'object') throw new Error('missing context reference')
+          ref = parsed as typeof ref
+        } catch {
+          throw new Error('invalid context reference')
+        }
+        const integration = this.agents
+          .get(work.agentId)
+          ?.integrations.find((candidate) => candidate.id === ref.integrationId)
+        if (!integration || integration.platform !== ref.platform || !ref.channel)
+          throw new Error('context source is no longer available')
+        const transportScope = this.transportScopeForIntegrationIds([ref.integrationId])
+        if (!transportScope) throw new Error('context source has no transport scope')
+        const cursor = afterCursor === undefined ? 0 : Number(afterCursor)
+        if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error('invalid context cursor')
+        return await this.store.standingWorkContextPage(
+          work.orgId,
+          work.agentId,
+          transcriptChannelKey(ref.channel, transportScope),
+          ref.thread,
+          cursor,
+          limit
+        )
+      }
+    }
+  }
+
+  /** Whether this process may construct and run the executing pump. OFF by default: while false the pump
+   *  is never built, so `standing-work-fixed-v1` is not advertised and no ambient turn ever runs — the
+   *  daemon still applies CP lifecycle decisions over its durable rows. */
+  private standingWorkExecutionAllowed(): boolean {
+    return this.opts.standingWorkExecution === true
+  }
+
+  /** Whether this process may write execution-audit rows. OFF by default: with it absent every recorder
+   *  call site is a no-op, so a default daemon keeps an empty outbox. Flushing those rows to the control
+   *  plane is a separate concern (A1 Phase 5), never a reason to start recording early. */
+  private executionAuditAllowed(): boolean {
+    return this.opts.executionAudit === true
+  }
+
+  /** Reconcile CP-authoritative standing-work projections from a register/ok snapshot into the durable
+   *  execution core. Independent of the execution opt-in: a daemon that advertises the capability but does
+   *  not sweep still mirrors its objectives so its rows never drift from the control plane. In default
+   *  mode the feature is never advertised, so the CP sends no projections and this stays inert. */
+  private async ingestStandingWorks(projections: StandingWorkProjection[]): Promise<void> {
+    if (projections.length === 0) return
+    const service = new StandingWorkService(this.store, () => this.clock.now())
+    for (const projection of projections) await service.ingestFromProjection(projection)
+  }
+
+  /** The `standing-work/report` catch-up a READY connection re-asserts, so runs that finished while the CP
+   *  was unreachable still land. Empty unless the executing pump is armed — a default daemon emits no run telemetry. */
+  private async standingWorkReports(): Promise<StandingWorkRunReport[]> {
+    if (!this.standingWorkPump) return []
+    return standingWorkReportCatchup(await this.store.standingWorkReportFeed())
+  }
+
+  /** Build + start the executing pump, but only under the operator opt-in. Until then `standingWorkPump`
+   *  stays undefined, so the feature is neither advertised nor swept — the daemon fails closed on running
+   *  autonomous work it was never told to own. Idempotent: a repeat call while running does nothing. */
+  private armStandingWorkPump(): void {
+    if (!this.standingWorkExecutionAllowed() || this.standingWorkPump) return
+    const service = new StandingWorkService(this.store, () => this.clock.now())
+    const executor = new StandingWorkAmbientExecutor(this.standingWorkAmbientRunner(), this.standingWorkContextReader())
+    const dispatcher = new StandingWorkMessageDispatcher(
+      new StandingWorkGatewayDestinationResolver({
+        connForIntegration: (integrationId) => {
+          const conn = this.connForIntegration(integrationId)
+          return conn ? { postMessage: (channel, text, thread) => conn.postMessage(channel, text, thread) } : undefined
+        }
+      }),
+      () => this.clock.now()
+    )
+    this.standingWorkPump = new StandingWorkPump(
+      this.store,
+      service,
+      this.store.cacheOwner,
+      executor,
+      dispatcher,
+      () => this.clock.now(),
+      (agentId) => this.servesAgent(agentId),
+      { emit: (report) => this.cpClient?.emitStandingWorkReport(report) },
+      () => this.cpClient?.state === 'READY',
+      async (work, notification) => {
+        if (this.cpClient?.state !== 'READY') return 'retry'
+        const agent = this.agents.get(work.agentId)
+        if (!agent || !this.servesAgent(work.agentId)) return 'suppress'
+        let destination: { integrationId?: unknown; platform?: unknown; channel?: unknown }
+        try {
+          destination = JSON.parse(notification.destination) as typeof destination
+        } catch {
+          return 'suppress'
+        }
+        if (
+          typeof destination.integrationId !== 'string' ||
+          typeof destination.platform !== 'string' ||
+          typeof destination.channel !== 'string' ||
+          !destination.channel
+        )
+          return 'suppress'
+        return agent.integrations.some(
+          (integration) => integration.id === destination.integrationId && integration.platform === destination.platform
+        )
+          ? 'allow'
+          : 'suppress'
+      },
+      () => [...this.agents.keys()].filter((agentId) => this.servesAgent(agentId)),
+      new DaemonAuditRecorder(
+        this.store,
+        () => this.executionAuditAllowed(),
+        () => this.clock.now()
+      )
+    )
+    this.standingWorkPump.start()
+    this.standingWorkWakeCoordinator = new StandingWorkWakeCoordinator(this.store, () => this.clock.now())
   }
 
   /**
@@ -7240,6 +7562,15 @@ export class Daemon {
     msg.transportScope ??= this.transportScopeForIntegrationIds(srcIntegrationIds)
     if (msg.sender.avatarUrl && msg.transportScope)
       await this.store.setProfileAvatar(msg.transportScope, msg.sender.id, msg.sender.avatarUrl, Date.now())
+    if (this.standingWorkWakeCoordinator && srcIntegrationIds?.length) {
+      for (const integrationId of srcIntegrationIds) {
+        void this.standingWorkWakeCoordinator.onConversationEvent({
+          platform: msg.platform,
+          integrationId,
+          channel: msg.channel
+        })
+      }
+    }
     // A mention in a watched Slack channel can arrive via both `message.*` and
     // `app_mention`; both share channel:ts, so dedup the double-fire from ONE bot
     // connection. Do not dedup across bot connections: several Slack apps receive
@@ -7362,10 +7693,12 @@ export class Daemon {
     const targetMsg = { ...msg }
     if (result.via === 'mention') targetMsg.trigger = 'mention'
     else delete targetMsg.trigger
+    const targetCoordinates = await this.sessionCoordinatesFor(result.agentId, targetMsg, result.integrationId)
     // Observation precedes activation gates and queue admission. A clarification
     // arriving while this logical thread is busy must be visible to the running
     // turn's final refresh even though its own SessionManager.handle() has not begun.
-    if (this.cfg.features.turnFinalContextRefresh) await this.recordObservedInbound(targetMsg, result.agentId)
+    if (this.cfg.features.turnFinalContextRefresh)
+      await this.recordObservedInbound(targetMsg, result.agentId, true, targetCoordinates)
     // Agent-scoped drain (scope:agent): this agent is being reclaimed/rebalanced —
     // drop new turns for it while its in-flight turns finish.
     if (this.drainingAgents.has(result.agentId)) {
@@ -7377,13 +7710,7 @@ export class Daemon {
     // auto / dm) never dispatches — only an explicit @mention does, and it clears the
     // mute. Muted-thread traffic still enters the transcript (recordUnrouted) so the
     // agent catches up on it when re-activated (§8.5).
-    const muteKey = sessionKey(
-      targetMsg.platform,
-      targetMsg.channel,
-      targetMsg.thread ?? targetMsg.msgId,
-      result.agentId,
-      targetMsg.transportScope
-    )
+    const muteKey = sessionKeyForCoordinates(result.agentId, targetMsg, targetCoordinates)
     if (await this.commands.isSessionMuted(muteKey)) {
       if (result.via !== 'mention') {
         await this.recordUnrouted(targetMsg)
@@ -7412,13 +7739,7 @@ export class Daemon {
           admission: Promise.resolve({
             admitted: true,
             agentId: result.agentId,
-            sessionKey: sessionKey(
-              targetMsg.platform,
-              targetMsg.channel,
-              targetMsg.thread ?? targetMsg.msgId,
-              result.agentId,
-              targetMsg.transportScope
-            ),
+            sessionKey: sessionKeyForCoordinates(result.agentId, targetMsg, targetCoordinates),
             turnId: stableTurnId(result.agentId, msg)
           }),
           completion: topLevel.then(
@@ -7434,7 +7755,7 @@ export class Daemon {
       result.integrationId,
       undefined,
       undefined,
-      { deliveryId: `${stableMessageId(targetMsg)}#${result.agentId}` }
+      { deliveryId: `${stableMessageId(targetMsg)}#${result.agentId}`, coordinates: targetCoordinates }
     )
     turn.catch((err) => this.log.error(`dispatch failed for agent "${result.agentId}": ${formatErr(err)}`))
     return { kind: 'dispatched', handle }
@@ -7513,12 +7834,18 @@ export class Daemon {
       const targetMsg = { ...msg }
       if (via === 'mention') targetMsg.trigger = 'mention'
       else delete targetMsg.trigger
-      if (this.cfg.features.turnFinalContextRefresh) await this.recordObservedInbound(targetMsg, agentId)
-      const targetThread = targetMsg.thread ?? targetMsg.msgId
-      const muteKey = sessionKey(targetMsg.platform, targetMsg.channel, targetThread, agentId, targetMsg.transportScope)
+      const peerCoordinates = await this.sessionCoordinatesFor(agentId, targetMsg, rule.integrationId)
+      if (this.cfg.features.turnFinalContextRefresh)
+        await this.recordObservedInbound(targetMsg, agentId, true, peerCoordinates)
+      const muteKey = sessionKeyForCoordinates(agentId, targetMsg, peerCoordinates)
       if (await this.commands.isSessionMuted(muteKey)) {
         if (via === 'implicit') {
-          await this.recordObservedInbound(targetMsg, agentId, this.cfg.features.turnFinalContextRefresh)
+          await this.recordObservedInbound(
+            targetMsg,
+            agentId,
+            this.cfg.features.turnFinalContextRefresh,
+            peerCoordinates
+          )
           outcomes.push({ kind: 'rejected', reason: 'gated' })
           continue
         }
@@ -7531,7 +7858,7 @@ export class Daemon {
         rule.integrationId,
         undefined,
         undefined,
-        { deliveryId: `${stableMessageId(targetMsg)}#${agentId}` }
+        { deliveryId: `${stableMessageId(targetMsg)}#${agentId}`, coordinates: peerCoordinates }
       )
       turn.catch((err) => this.log.error(`thread fan-out failed for agent "${agentId}": ${formatErr(err)}`))
       outcomes.push({ kind: 'dispatched', handle })
@@ -7813,13 +8140,10 @@ export class Daemon {
     // `handleRelayIm` applies the `!stop` gate only on the path this branch returns
     // before, so an implicit continuation is checked against it here — otherwise a muted
     // conversation would silence its humans and none of its agents.
-    const muteKey = sessionKey(
-      normalized.platform,
-      normalized.channel,
-      normalized.thread ?? normalized.msgId,
-      msg.agentId,
-      normalized.transportScope
-    )
+    // The mute gate keys on the physical thread coordinate (synchronously): append-mode
+    // mute semantics land with runtime activation, and awaiting a reservation here would
+    // insert a scheduling tick ahead of the supersede ordering this path must preserve.
+    const muteKey = sessionKeyForCoordinates(msg.agentId, normalized, currentSessionCoordinates(normalized))
     if (via === 'implicit' && (await this.commands.isSessionMuted(muteKey))) {
       await this.recordUnrouted(normalized)
       this.log.debug(`relay: dropping agent-authored ${msg.msgId} for "${msg.agentId}" (muted by !stop)`)
@@ -7966,13 +8290,8 @@ export class Daemon {
     // while muted, implicit routing (thread affinity / keyword / auto / dm) never
     // dispatches — only an explicit @mention does, and it clears the mute. Muted traffic
     // still enters the transcript so the agent catches up when re-activated (§8.5).
-    const muteKey = sessionKey(
-      normalized.platform,
-      normalized.channel,
-      normalized.thread ?? normalized.msgId,
-      msg.agentId,
-      normalized.transportScope
-    )
+    // Keyed on the physical thread coordinate synchronously; see the relay IM gate above.
+    const muteKey = sessionKeyForCoordinates(msg.agentId, normalized, currentSessionCoordinates(normalized))
     trace.stage = 'mute'
     if (await this.commands.isSessionMuted(muteKey)) {
       if (normalized.trigger !== 'mention') {
@@ -8230,13 +8549,8 @@ export class Daemon {
    * provider's next redelivery runs it a second time.
    */
   private async mintLinearDeliveryReceipt(msg: RdMsgIm, normalized: NormalizedMessage): Promise<boolean> {
-    const key = sessionKey(
-      normalized.platform,
-      normalized.channel,
-      normalized.thread ?? normalized.msgId,
-      msg.agentId,
-      normalized.transportScope
-    )
+    const coordinates = await this.sessionCoordinatesFor(msg.agentId, normalized, msg.integrationId)
+    const key = sessionKeyForCoordinates(msg.agentId, normalized, coordinates)
     return await this.store.appendInbox({
       id: linearDeliveryReceiptId(stableMessageId(normalized)),
       sessionKey: key,
@@ -8267,13 +8581,8 @@ export class Daemon {
     const agent = this.agents.get(msg.agentId)
     const agentName = agent?.displayName?.trim() || agent?.name || msg.agentId
     void (async () => {
-      const key = sessionKey(
-        normalized.platform,
-        normalized.channel,
-        normalized.thread ?? normalized.msgId,
-        msg.agentId,
-        normalized.transportScope
-      )
+      const coordinates = await this.sessionCoordinatesFor(msg.agentId, normalized, msg.integrationId)
+      const key = sessionKeyForCoordinates(msg.agentId, normalized, coordinates)
       // `none` is truly silent (§5.2): no ack, no activities, no issue write — transcript only.
       const mode = (await this.store.getOutputModeOverride(key)) ?? agent?.output?.mode ?? 'low'
       if (mode === 'none') return
@@ -9265,7 +9574,39 @@ export class Daemon {
   private async recordUnrouted(msg: NormalizedMessage): Promise<void> {
     // Preserve the established default transcript shape until the rollout flag is
     // enabled; the new observer folds attachment mentions into context prompts.
-    await this.recordObservedInbound(msg, undefined, this.cfg.features.turnFinalContextRefresh)
+    const physical = currentSessionCoordinates(msg)
+    const participants = await this.store.activeThreadParticipations(
+      msg.channel,
+      physical.deliveryThread,
+      msg.transportScope
+    )
+    // A cold first turn has passed admission but may not have written its session
+    // row yet. Its gate entry is authoritative for the same short interval, and
+    // lets an unrouted clarification join the correct append transcript while
+    // the runtime is still starting.
+    const active = [...this.activeGateEntries.values()]
+      .filter(
+        (entry) =>
+          entry.msg.channel === msg.channel &&
+          entry.msg.transportScope === msg.transportScope &&
+          entry.coordinates.deliveryThread === physical.deliveryThread
+      )
+      .map((entry) => ({ agentId: entry.agentId, sessionThread: entry.coordinates.sessionThread }))
+    const bySession = new Map<string, { agentId: string; sessionThread: string }>()
+    for (const participant of [...participants, ...active])
+      bySession.set(`${participant.agentId}\u0000${participant.sessionThread}`, participant)
+    if (bySession.size === 0) {
+      await this.recordObservedInbound(msg, undefined, this.cfg.features.turnFinalContextRefresh)
+      return
+    }
+    // A physical reply thread may feed several agents, each with its own append
+    // coordinate. Record one audience-scoped observation per logical session;
+    // do not let an unrouted event select or expose another agent's transcript.
+    for (const participant of bySession.values()) {
+      await this.recordObservedInbound(msg, participant.agentId, this.cfg.features.turnFinalContextRefresh, {
+        sessionThread: participant.sessionThread
+      })
+    }
   }
 
   /** Persist one conversational ingress for a live physical thread before routing
@@ -9274,9 +9615,10 @@ export class Daemon {
   private async recordObservedInbound(
     msg: NormalizedMessage,
     recipient?: string,
-    includeAttachment = true
+    includeAttachment = true,
+    coordinates: Pick<SessionCoordinates, 'sessionThread'> = currentSessionCoordinates(msg)
   ): Promise<void> {
-    const { thread, ts } = transcriptCoords(msg)
+    const { thread, ts } = transcriptCoords(msg, coordinates)
     const transcriptChannel = transcriptChannelKey(msg.channel, msg.transportScope)
     // Active = a session touched within the idle window OR a turn in flight right
     // now. The in-flight check is load-bearing: session.updatedAt is stamped at
@@ -9287,10 +9629,10 @@ export class Daemon {
     const recentlyActive =
       (await this.store.activeSessionCountSince(msg.channel, thread, sinceTs, msg.transportScope)) > 0
     const inFlightAgent = [...this.pending.values()].find(
-      (p) => p.plan.transcriptChannel === transcriptChannel && p.plan.statusThread === thread
+      (p) => p.plan.transcriptChannel === transcriptChannel && p.plan.sessionThread === thread
     )?.plan.agentId
     const initializingAgent = [...this.activeGateEntries.values()].find((entry) => {
-      const coords = transcriptCoords(entry.msg)
+      const coords = transcriptCoords(entry.msg, entry.coordinates)
       return (
         transcriptChannelKey(entry.msg.channel, entry.msg.transportScope) === transcriptChannel &&
         coords.thread === thread
@@ -9435,7 +9777,7 @@ export class Daemon {
         completeness: readState.truncated ? 'observed-only' : 'authoritative',
         events: history.map((event) => ({
           channel: pending.plan.transcriptChannel,
-          thread: pending.plan.statusThread,
+          thread: pending.plan.sessionThread,
           ts: event.ts,
           sender: event.sender,
           kind: 'text' as const,
@@ -9457,7 +9799,7 @@ export class Daemon {
     const refresh = await this.threadContext.refresh({
       agentId: pending.plan.agentId,
       transcriptChannel: pending.plan.transcriptChannel,
-      thread: pending.plan.statusThread,
+      thread: pending.plan.sessionThread,
       afterRevision,
       // Pairwise a2a threads are shared storage but private conversations:
       // scope the refresh to this agent's own rows (#967).
@@ -9487,13 +9829,13 @@ export class Daemon {
         // turn — a sibling's private delivery is not its context (#967).
         await this.store.transcriptSinceRevisionForAgent(
           pending.plan.transcriptChannel,
-          pending.plan.statusThread,
+          pending.plan.sessionThread,
           afterRevision,
           pending.plan.agentId
         )
       : await this.store.transcriptSinceRevision(
           pending.plan.transcriptChannel,
-          pending.plan.statusThread,
+          pending.plan.sessionThread,
           afterRevision,
           pending.plan.agentId
         )
@@ -9503,7 +9845,9 @@ export class Daemon {
   }
 
   private queuedEntriesMatchingContext(key: string, eventTs: ReadonlyMap<string, string | undefined>): QueueEntry[] {
-    return (this.serialQueue.get(key) ?? []).filter((entry) => eventTs.has(transcriptCoords(entry.msg).ts))
+    return (this.serialQueue.get(key) ?? []).filter((entry) =>
+      eventTs.has(transcriptCoords(entry.msg, entry.coordinates).ts)
+    )
   }
 
   private observedQuoteBlock(event: TranscriptEntry, replayed: readonly TranscriptEntry[]): string | undefined {
@@ -9514,7 +9858,7 @@ export class Daemon {
   /** An activation whose row a fence already folded into a prompt for this session: settle it
    *  as coalesced instead of queueing it. Returns false when nothing absorbed this message. */
   private async coalesceLateAdmission(key: string, entry: QueueEntry): Promise<boolean> {
-    if (!this.claimAbsorbedContext(key, transcriptCoords(entry.msg).ts)) return false
+    if (!this.claimAbsorbedContext(key, transcriptCoords(entry.msg, entry.coordinates).ts)) return false
     const sessionId = [...this.pending.values()].find((p) => p.plan.sessionKey === key)?.acpSessionId
     await this.coalesceEntryIntoTurn(entry, sessionId ?? null)
     defaultTurnOutputMetrics.queueCoalesced(entry.msg.platform, 1)
@@ -9538,7 +9882,7 @@ export class Daemon {
         stopReason: reason
       })
     }
-    const { thread, ts } = transcriptCoords(entry.msg)
+    const { thread, ts } = transcriptCoords(entry.msg, entry.coordinates)
     const mention = attachmentMention(entry.msg.attachments)
     await this.store.appendTranscript({
       channel: transcriptChannelKey(entry.msg.channel, entry.msg.transportScope),
@@ -9595,7 +9939,7 @@ export class Daemon {
     }
     // The live prompt now carries this row: remember it as absorbed AND already settled, so the
     // final fence does not regenerate for it and a late admission cannot coalesce it twice.
-    const { ts } = transcriptCoords(entry.msg)
+    const { ts } = transcriptCoords(entry.msg, entry.coordinates)
     this.noteAbsorbedContext(key, new Map([[ts, steeredTranscriptText(entry.msg)]]))
     this.claimAbsorbedContext(key, ts)
     await this.coalesceEntryIntoTurn(entry, target.acpSessionId, 'steered_into_turn')
@@ -9620,7 +9964,7 @@ export class Daemon {
     const kept: QueueEntry[] = []
     let count = 0
     for (const entry of queue) {
-      if (!eventTs.has(transcriptCoords(entry.msg).ts)) {
+      if (!eventTs.has(transcriptCoords(entry.msg, entry.coordinates).ts)) {
         kept.push(entry)
         continue
       }
@@ -10409,6 +10753,8 @@ export class Daemon {
       id,
       sessionKey: key,
       agentId: entry.agentId,
+      deliveryThread: entry.coordinates.deliveryThread,
+      sessionThread: entry.coordinates.sessionThread,
       msg: JSON.stringify(entry.msg),
       integrationId: entry.integrationId ?? null,
       callMeta: entry.callMeta ? JSON.stringify(entry.callMeta) : null,
@@ -10902,6 +11248,8 @@ export class Daemon {
       /** Stable target-scoped inbox id for a physical event delivered to more
        * than one agent. It does not replace the provider transcript identity. */
       deliveryId?: string
+      /** Already resolved for this target before its mute/observation checks. */
+      coordinates?: SessionCoordinates
       /** Mint a permanent DELIVERY RECEIPT under this id, in the SAME transaction as the
        * admission row (see `LocalStore.appendInboxWithReceipt`). For a provider whose
        * redelivery ladder outlives the turn: the ordinary row is deleted at settlement, so
@@ -10918,6 +11266,7 @@ export class Daemon {
         accepted: boolean
         reason?: string
         duplicate?: boolean
+        sessionKey?: string
         /** The delivery rode the running turn over `_session/steering`; no queue entry exists. */
         steered?: boolean
       }) => void | Promise<void>
@@ -10936,6 +11285,12 @@ export class Daemon {
     if (integrationId !== undefined) {
       msg.transportScope ??= this.transportScopeForIntegrationIds([integrationId])
     }
+    // Resolve target-specific coordinates exactly once, before observation and admission.
+    // The QueueEntry carries this trusted decision through every later seam. An ingress
+    // that runs an `append` target resolves the reservation upstream and threads it in via
+    // `opts.coordinates`; the default stays synchronous so this seam never inserts a
+    // scheduling tick ahead of the supersede ordering the relay/hook paths depend on.
+    const coordinates = opts?.coordinates ?? currentSessionCoordinates(msg)
     // An agent-initiated wake's INBOUND message posts live too (#807 only posted the woken
     // REPLY, so the sender's message appeared on refresh but never in the live view). Mint
     // its canonical post identity before the inbox row persists so a replay reuses it and
@@ -10950,13 +11305,13 @@ export class Daemon {
       this.cfg.features.turnFinalContextRefresh &&
       originKindOf(msg.platform) === 'chat'
     ) {
-      await this.recordObservedInbound(msg, agentId)
+      await this.recordObservedInbound(msg, agentId, true, coordinates)
     }
     // Not an async executor: a rejection from any awaited admission/store step must settle
     // THIS promise, not vanish as an unhandled rejection while the caller waits forever.
     return new Promise<string | null>((resolve, reject) => {
       void (async () => {
-        const key = sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
+        const key = sessionKeyForCoordinates(agentId, msg, coordinates)
         const reviewLane = reviewSubjectLane(hookContext, hookCoordinates(agentId, msg, integrationId))
         const safetyDrainByKey = this.safetyDrainAdmissionKeys.get(agentId)?.has(key) === true
         let admissionSettled = false
@@ -10990,17 +11345,14 @@ export class Daemon {
           const activationKey = callMeta?.activationKey
           if (activationKey !== undefined) {
             if (result.accepted) {
-              await this.store.admitActivation(
-                activationKey,
-                sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
-              )
+              await this.store.admitActivation(activationKey, key)
             } else {
               // Never admitted ⇒ give the claim back, so a retry is a first attempt rather
               // than being deduplicated against a child that was never opened.
               await this.store.releaseActivation(activationKey)
             }
           }
-          await opts?.onAdmission?.(result)
+          await opts?.onAdmission?.(result.accepted ? { ...result, sessionKey: key } : result)
         }
         // Drain gate for the dispatch entry itself — covers cron fires and `!queue`
         // that bypass onInbound's gate (§5.3: a draining unit starts no turn). Applied
@@ -11107,6 +11459,7 @@ export class Daemon {
         const entry: QueueEntry = {
           agentId,
           msg,
+          coordinates,
           initAbort: new AbortController(),
           ...(integrationId !== undefined ? { integrationId } : {}),
           ...(webchat ? { webchat } : {}),
@@ -11675,7 +12028,8 @@ export class Daemon {
           const runAdmittedEntry = entry.admissionWait === undefined || (await entry.admissionWait)
           entry.admissionWait = undefined
           if (runAdmittedEntry) {
-            if (entry.deferObservedInbound) await this.recordObservedInbound(entry.msg, entry.agentId)
+            if (entry.deferObservedInbound)
+              await this.recordObservedInbound(entry.msg, entry.agentId, true, entry.coordinates)
             const releaseDispatch = await this.admitActiveDispatch(entry.agentId, key)
             let sessionId: string | null
             try {
@@ -12155,6 +12509,18 @@ export class Daemon {
       }
       // §2.3/§5.3: hand the origin session id to prompt assembly so a child woken by another
       // session's `sendMessage` gets its `Parent session` line (the SessionTarget to reply into).
+      // Write the physical affinity before the runtime can spend a long time in
+      // its first prompt. The session row may be created moments later by
+      // `handle`; until then LocalStore's join intentionally keeps this record
+      // invisible, and a failed initialization leaves no routable stale owner.
+      await this.store.recordThreadParticipation({
+        channel: msg.channel,
+        thread: entry.coordinates.deliveryThread,
+        agentId,
+        sessionKey: key,
+        transportScope: msg.transportScope,
+        updatedAt: this.clock.now()
+      })
       handled = await this.sessions.handle(
         agentId,
         msg,
@@ -12166,6 +12532,7 @@ export class Daemon {
         // a standing directive naming the origin as the reply target.
         callMeta?.needsReply,
         {
+          coordinates: entry.coordinates,
           initializeOnly: plan.initializeOnly,
           // CallMeta is the trusted distinction between a real A2A delivery and
           // synthetic `source: agent` wakes (background task/orchestration). A webchat
@@ -12814,7 +13181,7 @@ export class Daemon {
     let finalCaptureInput = handled.captureInput ?? msg.text
     let baseRevision =
       handled.contextRevision ??
-      (await this.store.threadTranscriptRevision(p.plan.transcriptChannel, p.plan.statusThread, p.plan.agentId))
+      (await this.store.threadTranscriptRevision(p.plan.transcriptChannel, p.plan.sessionThread, p.plan.agentId))
     let providerCheckpoint = handled.providerCheckpoint
     if (p.plan.stageAnswer || p.plan.webchatRefresh) {
       // Queue entries remain untouched until every gate above has succeeded.
@@ -12847,7 +13214,7 @@ export class Daemon {
       await this.coalesceQueuedContext(key, sessionId, representedEventTs)
       baseRevision = await this.store.threadTranscriptRevision(
         p.plan.transcriptChannel,
-        p.plan.statusThread,
+        p.plan.sessionThread,
         p.plan.agentId
       )
       providerCheckpoint = initialRefresh.providerCheckpoint ?? providerCheckpoint
@@ -13030,7 +13397,7 @@ export class Daemon {
         .sort((a, b) => a.eventTimeUs - b.eventTimeUs || a.seq - b.seq)
       const finalRevision = await this.store.threadTranscriptRevision(
         p.plan.transcriptChannel,
-        p.plan.statusThread,
+        p.plan.sessionThread,
         p.plan.agentId
       )
 
@@ -13138,7 +13505,7 @@ export class Daemon {
       await this.coalesceQueuedContext(key, sessionId, eventTs)
       baseRevision = await this.store.threadTranscriptRevision(
         p.plan.transcriptChannel,
-        p.plan.statusThread,
+        p.plan.sessionThread,
         p.plan.agentId
       )
       generation += 1
@@ -13231,7 +13598,7 @@ export class Daemon {
         const replyTs = await webchatTurnOutput.appendWebchatTextRow(
           this.store,
           p.plan.transcriptChannel,
-          plan.statusThread,
+          plan.sessionThread,
           monotonicTs(),
           {
             postId: replyPostId,
@@ -13331,7 +13698,7 @@ export class Daemon {
     const { rec, sessionId, handled, memoryCaptureTarget } = turn
     const { stopReason, usage, finalCaptureInput } = turn.outcome
     // …and any trailing reasoning the agent emitted after its last reply.
-    for (const ev of rec.onFinal()) await this.recordEvent(agentId, plan.transcriptChannel, plan.statusThread, ev)
+    for (const ev of rec.onFinal()) await this.recordEvent(agentId, plan.transcriptChannel, plan.sessionThread, ev)
     // The turn is over, so nothing more will supersede a coalesced tool body: make the last
     // state of every streamed tool call durable now rather than on the buffer's own timer.
     await this.store.flushToolCallWrites()
@@ -13493,7 +13860,7 @@ export class Daemon {
         const replyTs = await webchatTurnOutput.appendWebchatTextRow(
           this.store,
           p.plan.transcriptChannel,
-          plan.statusThread,
+          plan.sessionThread,
           monotonicTs(),
           {
             postId: partialPostId,
@@ -13729,7 +14096,7 @@ export class Daemon {
         phase: settlement.finalPhase,
         platform: msg.platform,
         channel: msg.channel,
-        thread: plan.statusThread
+        thread: plan.sessionThread
       })
       p.signals.resolveDone()
     } else if (!settlement.propagatingTurnError) {
@@ -13969,10 +14336,10 @@ export class Daemon {
     if (!anchor) return
     const coords =
       'plan' in anchor
-        ? { channel: anchor.plan.transcriptChannel, thread: anchor.plan.statusThread }
+        ? { channel: anchor.plan.transcriptChannel, thread: anchor.plan.sessionThread }
         : {
             channel: transcriptChannelKey(anchor.msg.channel, anchor.msg.transportScope),
-            thread: transcriptCoords(anchor.msg).thread
+            thread: transcriptCoords(anchor.msg, anchor.coordinates).thread
           }
     const who = actor?.name?.trim() || actor?.userId
     const by = who ? ` by ${who}` : ''
@@ -14126,7 +14493,7 @@ export class Daemon {
   private async recordReplySegment(p: Pending, text: string): Promise<void> {
     await this.store.appendTranscript({
       channel: p.plan.transcriptChannel,
-      thread: p.plan.statusThread,
+      thread: p.plan.sessionThread,
       ts: monotonicTs(),
       sender: p.plan.agentId,
       kind: 'text',
@@ -14231,6 +14598,7 @@ export class Daemon {
       turnState<SlackTurnState>(p),
       action
     )
+    await this.recordOutboundParticipation(p)
   }
 
   /**
@@ -14256,6 +14624,7 @@ export class Daemon {
       turnState<TelegramTurnState>(p),
       action
     )
+    await this.recordOutboundParticipation(p)
   }
 
   /**
@@ -14280,6 +14649,7 @@ export class Daemon {
       p,
       action
     )
+    await this.recordOutboundParticipation(p)
   }
 
   /** Apply one Feishu action. Agent body delivery is one CardKit entity for the whole
@@ -14300,6 +14670,23 @@ export class Daemon {
       turnState<FeishuTurnState>(p),
       action
     )
+    await this.recordOutboundParticipation(p)
+  }
+
+  /** A successful platform action proves that this agent participates in the
+   * physical destination. Keep this independent of the logical append session
+   * coordinate, which is never a provider thread identifier. */
+  private async recordOutboundParticipation(p: Pending): Promise<void> {
+    const thread = p.plan.statusThread
+    if (!thread) return
+    await this.store.recordThreadParticipation({
+      channel: p.plan.channel,
+      thread,
+      agentId: p.plan.agentId,
+      sessionKey: p.plan.sessionKey,
+      transportScope: p.plan.transportScope,
+      updatedAt: this.clock.now()
+    })
   }
 
   /** Web App console base URL the CP sent on `auth/ok` (its own console origin). A local
@@ -14359,7 +14746,7 @@ export class Daemon {
     if (!posted.shown) return
     const row: AppRow = {
       channel: p.plan.transcriptChannel,
-      thread: p.plan.statusThread,
+      thread: p.plan.sessionThread,
       ts: monotonicTs(),
       sender: p.plan.agentId,
       appId,
@@ -14442,7 +14829,7 @@ export class Daemon {
       const row: AppRow | undefined = p
         ? {
             channel: p.plan.transcriptChannel,
-            thread: p.plan.statusThread,
+            thread: p.plan.sessionThread,
             // The monotonic internal-event clock, as every other non-conversational row uses: it
             // keeps the card where it was opened and cannot collide with a second card's row.
             ts: monotonicTs(),
@@ -15732,7 +16119,7 @@ export class Daemon {
     }
     // Full activity log (tool/reasoning), recorded regardless of output mode.
     for (const ev of p.rec.onUpdate(update))
-      await this.recordEvent(p.plan.agentId, p.plan.transcriptChannel, p.plan.statusThread, ev)
+      await this.recordEvent(p.plan.agentId, p.plan.transcriptChannel, p.plan.sessionThread, ev)
   }
 
   /** Persist one internal activity event (tool/reasoning/plan). Ordered by row `seq`, so its
@@ -16034,6 +16421,22 @@ export class Daemon {
       if (int) return int
     }
     return undefined
+  }
+
+  private sessionCoordinatesFor(
+    agentId: string,
+    msg: NormalizedMessage,
+    integrationId?: string
+  ): Promise<SessionCoordinates> {
+    const integration = integrationId
+      ? this.agents.get(agentId)?.integrations?.find((candidate) => candidate.id === integrationId)
+      : undefined
+    return resolveSessionCoordinates(
+      this.store,
+      agentId,
+      msg,
+      integration ? integrationSessionMode(integration, msg.channel) : 'createNew'
+    )
   }
 
   /** The transport scope whose observed session history a history-backed MCP read may see: the integration the read named (#1965 — an explicit `integrationId`, the conversation's own bot, or the host's answer), else the agent's only bot on the platform, and undefined when nothing is attributable to one physical bot (the read then returns []). Re-checked against the agent's OWN integrations, so a stale session snapshot cannot widen it; a session that spanned several bots carries a `mixed:` scope and belongs to none of them. */
@@ -19092,6 +19495,12 @@ export class Daemon {
           ...(row.isQueueCmd ? { isQueueCmd: true } : {}),
           fromInboxReplay: true,
           inboxReplayId: row.id,
+          // Never re-resolve a persisted append delivery against the current
+          // reservation/mode. Rows written before this field existed preserve
+          // their historical per-thread behaviour.
+          ...(row.deliveryThread && row.sessionThread
+            ? { coordinates: { deliveryThread: row.deliveryThread, sessionThread: row.sessionThread } }
+            : {}),
           // Marker 0 is a pre-loop-guard admission (including rows retained while the
           // agent lived on another daemon). Charge it once; persistInbox advances it to
           // 1 after successful admission. Current-version rows remain replay-neutral.
@@ -19187,6 +19596,7 @@ export class Daemon {
       cpCollab: () => this.cpCollab,
       cpMcpDefs: () => this.cpMcpDefs,
       memoryConnections: () => this.memoryConnections,
+      ingestStandingWorks: (projections) => this.ingestStandingWorks(projections),
       convergeRelays: (relays) => this.convergeRelays(relays),
       onMcpDefsChanged: () => this.onMcpDefsChanged(),
       exactCpDependents: (agentId, desired) => this.exactCpDependents(agentId, desired),
@@ -19306,11 +19716,13 @@ export class Daemon {
       memoryConnections: () => this.memoryConnections,
       replayHookTerminalReports: () => this.replayHookTerminalReports(),
       replayChannelSnapshots: () => this.replayChannelSnapshots(),
+      armExecutionAuditFlush: () => this.executionAuditFlusher.arm(),
       replayApprovalActivity: () => this.permissions.replayApprovalActivity(),
       sessionMetadataOutbox: () => this.sessionMetadataOutbox,
       webchatMcpRevocations: () => this.webchatMcpRevocations,
       drainSessionPurges: () => this.drainSessionPurges(),
       effectiveAgents: () => this.effectiveAgents(),
+      standingWorkReports: () => this.standingWorkReports(),
       noteProjector: () => this.noteProjector,
       codeHostReviews: () => this.reviewOutbox,
       cpAgents: () => this.cpAgents,
@@ -19352,7 +19764,8 @@ export class Daemon {
       withWorkspaceIndexWrite: <T>(agentId: string, write: () => Promise<T>): Promise<T> =>
         this.withWorkspaceIndexWrite(agentId, write),
       runCommitMessagePass: (agentId, systemPrompt, prompt, signal) =>
-        this.runCommitMessagePass(agentId, systemPrompt, prompt, signal)
+        this.runCommitMessagePass(agentId, systemPrompt, prompt, signal),
+      standingWorkControl: () => this.standingWorkControl
     }
   }
 
@@ -19394,7 +19807,8 @@ export class Daemon {
     label: string,
     safetyReviewLane?: string
   ): Promise<AnchorTriggerResult> {
-    const key = sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
+    const coordinates = await this.sessionCoordinatesFor(agentId, msg, target?.integrationId)
+    const key = sessionKeyForCoordinates(agentId, msg, coordinates)
     // Gate BEFORE the anchor side effect. Cron scheduling remains registered while an
     // agent is paused, but a paused/draining/safety-stopping agent must publish nothing
     // and start no turn.
@@ -20284,6 +20698,9 @@ export class Daemon {
       this.hookReportRetryTimer = undefined
     }
     this.sessionMetadataOutbox.dispose()
+    // An unacknowledged audit row is still durable, so shutdown drops the timer and leaves the
+    // backlog for the next process rather than waiting on the control plane.
+    this.executionAuditFlusher.dispose()
     // Clear any live orchestration deadline timers so they don't hold the process open
     // (the durable `orchestration.deadline` epoch re-arms them on the next startup).
     for (const t of this.collab.orchestrationDeadlines.values()) this.clock.clearTimeout(t)
@@ -20312,6 +20729,9 @@ export class Daemon {
     const errors: unknown[] = []
     this.scheduler?.stop()
     this.dreamScheduler?.stop()
+    // Stop sweeping before transport/store teardown so no ambient turn dispatches into a closing runtime.
+    this.standingWorkPump?.stop()
+    this.standingWorkWakeCoordinator?.stop()
     // CP editor writes, accepted Dream publication, and on-demand Git pulls all
     // hold this identity-tracked lease. The daemon-wide gate above rejects new
     // admissions; drain every already-admitted mutation before transport/store

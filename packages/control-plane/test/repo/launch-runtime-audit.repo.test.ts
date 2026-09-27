@@ -219,9 +219,69 @@ describe('AuditRepo — append-only feed (real Postgres)', () => {
       details: { capability: 'attachment.put' }
     })
 
-    const recent = await repo.recent(10)
-    expect(recent).toHaveLength(2)
-    expect(recent[0]?.kind).toBe('scope_denied') // newest first
-    expect(recent[0]?.details).toEqual({ capability: 'attachment.put' })
+    const page = await repo.search({ orgId: OrgId(DEFAULT_ORG_ID), limit: 10 })
+    expect(page.events).toHaveLength(2)
+    expect(page.nextCursor).toBeNull() // no third row → tail reached
+    expect(page.events[0]?.kind).toBe('scope_denied') // newest first
+    expect(page.events[0]?.details).toEqual({ capability: 'attachment.put' })
+  })
+
+  it('search is org-scoped and paginates newest-first by cursor', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const repo = new PgAuditRepo(prisma)
+    const otherOrg = OrgId('org_other000000000000000000')
+    for (let i = 0; i < 3; i++) {
+      await repo.append({ kind: 'daemon_auth', orgId: OrgId(DEFAULT_ORG_ID), message: `mine-${i}` })
+    }
+    await repo.append({ kind: 'daemon_auth', orgId: otherOrg, message: 'not-mine' })
+
+    const first = await repo.search({ orgId: OrgId(DEFAULT_ORG_ID), limit: 2 })
+    expect(first.events.map((e) => e.message)).toEqual(['mine-2', 'mine-1'])
+    expect(first.nextCursor).not.toBeNull()
+
+    const second = await repo.search({ orgId: OrgId(DEFAULT_ORG_ID), limit: 2, cursor: first.nextCursor! })
+    expect(second.events.map((e) => e.message)).toEqual(['mine-0'])
+    expect(second.nextCursor).toBeNull()
+    // The other org's row never appears in either page.
+    expect([...first.events, ...second.events].every((e) => String(e.orgId) === DEFAULT_ORG_ID)).toBe(true)
+  })
+
+  it('absorbs a replayed eventId as the same fact, not a second row (real Postgres)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const repo = new PgAuditRepo(prisma)
+    const eventId = 'f'.repeat(64)
+    const row = {
+      kind: 'admission' as const,
+      orgId: OrgId(DEFAULT_ORG_ID),
+      daemonId: DaemonId(DAEMON),
+      message: 'admission',
+      eventId,
+      traceId: 'trace-1',
+      source: 'daemon' as const
+    }
+    expect(await repo.appendOnce(row)).toBe(true)
+    // A daemon retries a flush whose reply it never saw; the conflict is the success this path needs.
+    expect(await repo.appendOnce(row)).toBe(false)
+
+    const page = await repo.search({ orgId: OrgId(DEFAULT_ORG_ID), limit: 10 })
+    expect(page.events).toHaveLength(1)
+    expect(page.events[0]).toMatchObject({ kind: 'admission', eventId, traceId: 'trace-1', source: 'daemon' })
+  })
+
+  it('lets a different fact through the same door, keyed by its own eventId', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const repo = new PgAuditRepo(prisma)
+    const row = (eventId: string, kind: 'admission' | 'external_effect') => ({
+      kind,
+      orgId: OrgId(DEFAULT_ORG_ID),
+      daemonId: DaemonId(DAEMON),
+      message: kind,
+      eventId,
+      traceId: 'trace-1'
+    })
+    expect(await repo.appendOnce(row('a'.repeat(64), 'admission'))).toBe(true)
+    expect(await repo.appendOnce(row('b'.repeat(64), 'external_effect'))).toBe(true)
+    const page = await repo.search({ orgId: OrgId(DEFAULT_ORG_ID), limit: 10 })
+    expect(page.events.map((e) => e.kind)).toEqual(['external_effect', 'admission'])
   })
 })

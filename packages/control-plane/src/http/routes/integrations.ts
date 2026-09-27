@@ -18,7 +18,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import { manifestFor } from '@agentconnect.md/protocol'
+import { CONVERSATION_SESSION_MODE_V1_FEATURE, manifestFor } from '@agentconnect.md/protocol'
 import type { ZodTypeProvider } from '../plugins/zod.js'
 import { Tag } from '../plugins/openapi.js'
 import type { HttpDeps } from '../deps.js'
@@ -35,6 +35,7 @@ import { installNewBot } from '../install-bot.js'
 import { removeIntegrationRow } from '../uninstall.js'
 import { BotExternalIdentityTaken } from '../../persistence/errors.js'
 import { integrationPlatformAvailability } from '../daemon-platform-capability.js'
+import { dutyEligibility } from '../../domain/placement.js'
 import { relayIngress } from '../relay-ingress.js'
 import { buildCreateIntegrationBody, credentialBlockOf } from '../dto/create-integration-body.js'
 import type { CpConfigRefusal } from '../../platforms/provider.js'
@@ -69,7 +70,11 @@ function toChannelDto(c: IntegrationChannelRecord): IntegrationChannelDtoT {
   }
 }
 
-function toDto(i: IntegrationRecord, channels: IntegrationChannelRecord[] = []): IntegrationDtoT {
+function toDto(
+  i: IntegrationRecord,
+  channels: IntegrationChannelRecord[] = [],
+  supportsAppendSessionMode = false
+): IntegrationDtoT {
   return {
     id: i.id,
     name: i.name,
@@ -79,6 +84,7 @@ function toDto(i: IntegrationRecord, channels: IntegrationChannelRecord[] = []):
     status: i.status,
     ...(i.feishuRegion ? { region: i.feishuRegion } : {}),
     createdAt: i.createdAt.toISOString(),
+    supportsAppendSessionMode,
     channels: channels.map(toChannelDto)
   }
 }
@@ -94,6 +100,29 @@ export function integrationRoutes(deps: HttpDeps) {
     // The caller's active org — every read/write below is scoped to it.
     const orgIdOf = (req: { orgCtx?: { orgId: OrgId } }) => req.orgCtx!.orgId
     const refreshMutationAgent = (observed: AgentRecord) => refreshAgentUnderMutation(deps.repos.agent, observed)
+
+    /** All eligible placements of every sibling must be upgraded, including idle set members. */
+    const supportsAppendFor = async (installs: readonly IntegrationRecord[]): Promise<boolean> => {
+      if (installs.length === 0) return false
+      for (const install of installs) {
+        const agent = await deps.repos.agent.get(install.orgId, install.agentId)
+        if (!agent) return false
+        const eligibility = dutyEligibility(agent)
+        const daemonIds =
+          eligibility.scope === 'daemon'
+            ? [eligibility.daemonId]
+            : eligibility.scope === 'set'
+              ? await deps.repos.memberSet.memberIdsOf(eligibility.setId)
+              : []
+        if (daemonIds.length === 0) return false
+        for (const daemonId of daemonIds) {
+          const conn = deps.daemonConns.get(daemonId)
+          if (conn?.state !== 'READY' || !conn.capabilities?.features.includes(CONVERSATION_SESSION_MODE_V1_FEATURE))
+            return false
+        }
+      }
+      return true
+    }
 
     // Push the full spec (metadata + tokens + per-conversation bindRules) to every
     // daemon that serves the owning agent — its placement AND any duty holder
@@ -561,14 +590,19 @@ export function integrationRoutes(deps: HttpDeps) {
             }
           }
         }
-        return hydrated.map(({ integration, channels }) =>
-          toDto(
-            integration,
-            channels.map((channel) => {
-              const state = effective.get(`${integration.botId}\u0000${channel.channelId}`)
-              return state ? { ...channel, agentId: state.agentId, trigger: state.trigger } : channel
-            })
-          )
+        return Promise.all(
+          hydrated.map(async ({ integration, channels }) => {
+            const bot = await deps.repos.bot.get(integration.orgId, integration.botId)
+            const installs = bot?.transport === 'http' ? await deps.repos.integration.listForBot(bot.id) : [integration]
+            return toDto(
+              integration,
+              channels.map((channel) => {
+                const state = effective.get(`${integration.botId}\u0000${channel.channelId}`)
+                return state ? { ...channel, agentId: state.agentId, trigger: state.trigger } : channel
+              }),
+              await supportsAppendFor(installs)
+            )
+          })
         )
       }
     )
@@ -838,6 +872,17 @@ export function integrationRoutes(deps: HttpDeps) {
             refreshed.set(current.id, current)
           }
           agent = refreshed.get(agent.id)!
+          if (req.body.sessionMode === 'append') {
+            const affected = botScopedConversation ? await deps.repos.integration.listForBot(bot.id) : [integration]
+            if (!(await supportsAppendFor(affected))) {
+              return reply.code(409).send({
+                error: 'Conflict',
+                statusCode: 409,
+                code: 'CONVERSATION_SESSION_MODE_UNSUPPORTED',
+                message: 'Continuous conversation requires an upgraded daemon.'
+              })
+            }
+          }
           // HTTP conversation ownership is bot-scoped even though membership rows are
           // stored per integration. Route the whole patch through the orchestrator
           // so every agent detail shows the same owner/trigger and exactly one row

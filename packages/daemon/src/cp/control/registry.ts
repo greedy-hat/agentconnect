@@ -68,6 +68,7 @@ import { runtimeCommands, skillsLocal, type SkillsControlDeps } from './skills.j
 import { taskList, type TaskControlDeps } from './task.js'
 import { autoMergeSet, autoMergeState, type AutoMergeControlDeps } from './automerge.js'
 import { sandboxKeepAlive, type SandboxKeepAliveDeps } from './sandbox-keepalive.js'
+import { standingWorkControl, type StandingWorkControlDeps } from './standing-work.js'
 import {
   workspaceDelete,
   workspaceGitCommit,
@@ -107,7 +108,8 @@ export interface ControlDeps
     TaskControlDeps,
     AutoMergeControlDeps,
     SandboxKeepAliveDeps,
-    WorkspaceControlDeps {}
+    WorkspaceControlDeps,
+    StandingWorkControlDeps {}
 
 /** Every dispatchable C→D control frame kind, by wire type. A type absent here is ignored. */
 export const CONTROL_HANDLERS: Map<string, ControlHandler<ControlDeps>> = new Map<string, ControlHandler<ControlDeps>>([
@@ -119,6 +121,7 @@ export const CONTROL_HANDLERS: Map<string, ControlHandler<ControlDeps>> = new Ma
   ['cron/upsert', cronUpsert],
   ['cron/remove', cronRemove],
   ['cron/run', cronRun],
+  ['standing-work/control', standingWorkControl],
   ['session/visibility', sessionVisibility],
   ['session/visibility/snapshot', sessionVisibilitySnapshot],
   ['route/assign', routeAssign],

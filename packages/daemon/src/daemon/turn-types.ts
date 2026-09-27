@@ -25,6 +25,7 @@ import type { HookDispatchContext } from '../github/hook-coords.js'
 import type { CodeHostReplyTarget } from '../codehost/reply-target.js'
 import type { WebchatTurnContext } from '../webchat/types.js'
 import type { WorkspaceFileLinkResolver } from '../messages/workspace-file-links.js'
+import type { SessionCoordinates } from '../session/session-coordinate.js'
 
 /** Thrown to a `dispatch()` caller when the per-session admission queue is at its depth
  *  cap (§4.4 backpressure): the message is fast-failed, not buffered. Carries a stable
@@ -287,6 +288,8 @@ export type TurnLifecycleCleanupOutcome = { blocked: false } | { blocked: true; 
 export interface QueueEntry {
   agentId: string
   msg: NormalizedMessage
+  /** Trusted target-specific coordinates selected once before admission. */
+  coordinates: SessionCoordinates
   /** Cancels the entire cold SessionManager initialization path after the bounded
    *  host-stop backstop, including non-host awaits such as workspace/history I/O. */
   initAbort: AbortController

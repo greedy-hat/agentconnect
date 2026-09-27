@@ -26,6 +26,9 @@ export type AgentCommand =
   /** `!cancel` — interrupt the in-flight turn but leave the session LIVE (no mute):
    *  follow-up messages still dispatch. The lighter-weight "just stop this turn". */
   | { kind: 'cancel' }
+  /** `!new` — start a fresh context. In an append conversation this advances
+   * the agent's conversation generation; per-thread sessions clear in place. */
+  | { kind: 'new' }
   /** `!resume` — explicitly reset a latched conversation loop guard (and clear a
    *  standing thread mute). Purged loop messages are never replayed. */
   | { kind: 'resume' }
@@ -53,6 +56,7 @@ export const COMMAND_PREFIXES = ['!', '/'] as const
 
 const STOP_WORDS = new Set(['stop'])
 const CANCEL_WORDS = new Set(['cancel'])
+const NEW_WORDS = new Set(['new'])
 const RESUME_WORDS = new Set(['resume'])
 const QUEUE_WORDS = new Set(['queue'])
 const STATUS_WORDS = new Set(['status'])
@@ -79,6 +83,7 @@ export function parseCommand(raw: string): AgentCommand | null {
   const arg = (m[2] ?? '').trim()
   if (STOP_WORDS.has(word)) return { kind: 'stop' }
   if (CANCEL_WORDS.has(word)) return { kind: 'cancel' }
+  if (NEW_WORDS.has(word)) return { kind: 'new' }
   if (RESUME_WORDS.has(word)) return { kind: 'resume' }
   if (QUEUE_WORDS.has(word)) return { kind: 'queue', text: arg }
   if (STATUS_WORDS.has(word)) return { kind: 'status' }

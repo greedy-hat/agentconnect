@@ -72,12 +72,15 @@ export const Tag = {
   Environment: 'Organization variables & secrets',
   Memory: 'External memory',
   Crons: 'Crons',
+  StandingWork: 'Standing work',
   Hooks: 'Hooks',
   Usage: 'Usage',
   Stream: 'Stream',
   GitHub: 'GitHub',
   GitLab: 'GitLab',
-  Gitea: 'Gitea'
+  Gitea: 'Gitea',
+  Principals: 'Principals',
+  Audit: 'Audit'
 } as const
 
 /** Group order + blurbs for the docs sidebar (OpenAPI top-level `tags`). */
@@ -125,6 +128,11 @@ const TAG_DESCRIPTIONS: ReadonlyArray<{ name: string; description: string }> = [
   },
   { name: Tag.Crons, description: 'Scheduled agent runs.' },
   {
+    name: Tag.StandingWork,
+    description:
+      'Durable fixed-schedule agent work — its definitions, approvals, and the daemon-reported run history the console inspects and stops.'
+  },
+  {
     name: Tag.Hooks,
     description: 'Inbound-webhook triggers — an external POST to a relay ingress URL fires an agent turn.'
   },
@@ -137,6 +145,15 @@ const TAG_DESCRIPTIONS: ReadonlyArray<{ name: string; description: string }> = [
   {
     name: Tag.GitLab,
     description: 'GitLab.com OAuth connections — the administration identity for project discovery and provisioning.'
+  },
+  {
+    name: Tag.Principals,
+    description: 'Org-owned execution identities — principals and their capability grants (I1 Agent Identity v1).'
+  },
+  {
+    name: Tag.Audit,
+    description:
+      'Org-isolated audit trail — filtered, cursor-paginated search and bounded JSON export (A1 Unified Audit).'
   }
 ]
 

@@ -94,13 +94,16 @@ function blockingHost() {
 }
 
 /** Make bot-a routable for DMs + explicit @mention and wire a fake reply connection. */
-function makeRoutable(daemon: Daemon) {
+function makeRoutable(daemon: Daemon, sessionMode?: 'append') {
   const a = (daemon as any).agents.get('bot-a')
   a.integrations = [
     {
       id: 'int-a',
       platform: 'slack',
-      core: { bindRules: [{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }] },
+      core: {
+        bindRules: [{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }],
+        ...(sessionMode ? { sessionModes: [{ channel: 'C1', mode: sessionMode }] } : {})
+      },
       config: { botToken: 'b', appToken: 'p', botUserId: 'UBOTA' }
     }
   ]
@@ -561,6 +564,52 @@ describe('Daemon in-conversation commands', () => {
     blocked.release()
     await turn
     await daemon.stop()
+  })
+
+  it('!stop in an append conversation cancels without muting the whole channel', async () => {
+    const blocked = blockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => blocked.host as any
+    })
+    await daemon.start()
+    const conn = makeRoutable(daemon, 'append')
+    try {
+      // Ingress resolves the integration's append policy before dispatch; the
+      // lower-level dispatch helper intentionally accepts already-resolved data.
+      await (daemon as any).onInboundOutcome(dm('100', 'hello'))
+      await vi.waitFor(() => expect(hasPending(daemon, 'acp-1')).toBe(true), WAIT)
+      const appendKey = [...(daemon as any).pending.values()][0].plan.sessionKey as string
+      const appendThread = [...(daemon as any).pending.values()][0].plan.sessionThread as string
+
+      // An unknown mention cannot be routed, but its context still belongs to
+      // the append session that is actively participating in this physical thread.
+      await (daemon as any).recordUnrouted(dm('150', 'unrouted clarification'))
+      expect(
+        (
+          await (daemon as any).store.transcriptSince(
+            transcriptChannelKey('C1', TRANSPORT_SCOPE),
+            appendThread,
+            '100',
+            'bot-a'
+          )
+        ).map((row: { text: string }) => row.text)
+      ).toContain('unrouted clarification')
+
+      await (daemon as any).onInboundOutcome(dm('200', '!stop'))
+      expect(blocked.host.cancel).toHaveBeenCalledWith('acp-1')
+      expect(await (daemon as any).store.isSessionMuted(appendKey)).toBe(false)
+      expect(conn.postMessage).toHaveBeenCalledWith(
+        'C1',
+        expect.stringContaining('Continuous conversation remains active'),
+        'T1',
+        CHROME_REPLY
+      )
+    } finally {
+      blocked.release()
+      await daemon.stop()
+    }
   })
 
   it('!stop latches mute for a cold head before its session row exists', async () => {

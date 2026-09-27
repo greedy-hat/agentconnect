@@ -53,6 +53,10 @@ const CoreConfigShape = {
   // sweeps every CRON_RUN_REAP_INTERVAL_SEC.
   CRON_RUN_TTL_SEC: z.coerce.number().int().default(1800),
   CRON_RUN_REAP_INTERVAL_SEC: z.coerce.number().int().default(300),
+  // Standing-work expiry sweep: transitions CP-side `StandingWorkDef` rows whose
+  // `expiresAt` has passed to `expired`. The daemon has its own local reaper; this
+  // keeps the PostgreSQL projection (the console's source) in step.
+  STANDING_WORK_EXPIRY_REAP_INTERVAL_SEC: z.coerce.number().int().default(300),
   // ── Session-access cache policy (session-access-cold-visit.md §2.3) ──
   // Any cached access decision older than this must be re-verified (seconds).
   // Per-user checks (workspace membership, repo permission) block until

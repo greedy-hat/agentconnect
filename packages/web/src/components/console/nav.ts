@@ -29,6 +29,9 @@ export const NAV_GROUPS: NavItem[][] = [
     { href: '/agents', label: 'Agents', icon: 'bot' },
     { href: '/sessions', label: 'Sessions', icon: 'messages-square' },
     { href: '/crons', label: 'Schedules', icon: 'calendar-clock' },
+    { href: '/standing-work', label: 'Standing work', icon: 'repeat', requires: 'standing-work' },
+    { href: '/principals', label: 'Principals', icon: 'shield-check', requires: 'principals' },
+    { href: '/audit', label: 'Audit', icon: 'scroll-text', requires: 'audit' },
     { href: '/tools', label: 'Tools & Skills', icon: 'blocks' },
     { href: '/integrations', label: 'Integrations', icon: 'plug' },
     { href: '/knowledge', label: 'Knowledge', icon: 'book-open' }
@@ -56,6 +59,9 @@ export const MOBILE_NAV: NavItem[] = [
 // prepended separately, in the sheet itself.
 export const MORE_ROWS: NavItem[] = [
   { href: '/tools', label: 'Tools & Skills', icon: 'blocks' },
+  { href: '/standing-work', label: 'Standing work', icon: 'repeat', requires: 'standing-work' },
+  { href: '/principals', label: 'Principals', icon: 'shield-check', requires: 'principals' },
+  { href: '/audit', label: 'Audit', icon: 'scroll-text', requires: 'audit' },
   { href: '/integrations', label: 'Integrations', icon: 'plug' },
   { href: '/knowledge', label: 'Knowledge', icon: 'book-open' },
   { href: '/daemons', label: 'Infra', icon: 'server' },
@@ -73,6 +79,9 @@ export const SECTIONS: { prefix: string; label: string }[] = [
   // Merged conversation pages live in the Sessions section (§5.3).
   { prefix: '/conversations', label: 'Sessions' },
   { prefix: '/crons', label: 'Schedules' },
+  { prefix: '/standing-work', label: 'Standing work' },
+  { prefix: '/principals', label: 'Principals' },
+  { prefix: '/audit', label: 'Audit' },
   { prefix: '/tools', label: 'Tools & Skills' },
   { prefix: '/integrations', label: 'Integrations' },
   { prefix: '/knowledge', label: 'Knowledge' },
@@ -101,6 +110,9 @@ export interface ConsolePage extends NavItem {
 // like "bots" land on the page that owns that feature.
 const PAGE_KEYWORDS: Record<string, string[]> = {
   '/crons': ['cron'],
+  '/standing-work': ['ambient', 'durable', 'goal', 'watch'],
+  '/principals': ['identity', 'grant', 'service account', 'execution'],
+  '/audit': ['log', 'event', 'actor', 'trace', 'provenance', 'export'],
   '/billing': ['balance', 'credit', 'invoice', 'payment', 'top up'],
   '/tools': ['mcp', 'connectors', 'skills'],
   '/integrations': ['bots', 'github', 'slack', 'telegram', 'discord', 'lark', 'feishu'],

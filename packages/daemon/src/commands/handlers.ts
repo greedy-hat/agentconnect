@@ -20,9 +20,12 @@ import type { AgentCommand } from './commands.js'
 import type { Logger } from '../log.js'
 import type { LoadedAgent } from '../agents/load-agents.js'
 import type { NormalizedMessage } from '../messages/normalized.js'
+import type { SessionCoordinates } from '../session/session-coordinate.js'
+import { transcriptCoords } from '../session/session-manager.js'
 import { routeRules, type RouteVia } from '../router/routing-table.js'
 import { conversationAdmitted, integrationRouting, type RoutingRule } from '../router/routing-rule.js'
-import { sessionKey, type LocalStore, type SessionRecord } from '../store/local-store.js'
+import { sessionKey, transcriptChannelKey, type LocalStore, type SessionRecord } from '../store/local-store.js'
+import { monotonicTs } from '../store/monotonic-ts.js'
 import {
   CommandChromeRegistry,
   type CommandChromeContext,
@@ -50,6 +53,7 @@ import {
 export interface CommandHost {
   log(): Logger
   store(): LocalStore
+  resolveSessionCoordinates(agentId: string, msg: NormalizedMessage, integrationId: string): Promise<SessionCoordinates>
   /** The served agent roster; commands read integrations, admission and chat authority off it. */
   agents(): ReadonlyMap<string, LoadedAgent>
   /** Live turns keyed by (agentId, acpSessionId) — read for the status bar and loop-guard state. */
@@ -521,7 +525,8 @@ export class CommandHandlers {
     // /cancel /status /fast /models /effort /permission /queue all operate on it rather
     // than on a phantom empty thread. `thread`/`key` follow the resolved session so a
     // `/queue` dispatch continues it and the sticky overrides land on the right key.
-    let thread = replyThread
+    const coordinates = await this.host.resolveSessionCoordinates(target.agentId, msg, target.integrationId)
+    let thread = coordinates.sessionThread
     let key = sessionKey(msg.platform, msg.channel, thread, target.agentId, msg.transportScope)
     let rec = await this.host.store().getSession(key)
     // A cold turn owns its logical key before SessionManager persists the session row.
@@ -530,7 +535,7 @@ export class CommandHandlers {
     // actual turn running. Check all gate representations because commands can race the
     // short hand-offs between them.
     let directGateActive = this.gateActiveFor(key)
-    if (!rec && !directGateActive) {
+    if (!rec && !directGateActive && coordinates.sessionThread === coordinates.deliveryThread) {
       const latest = await this.host.store().latestSessionForTransport(target.agentId, msg.channel, msg.transportScope)
       if (latest) {
         rec = latest
@@ -584,12 +589,116 @@ export class CommandHandlers {
     resume: { run: async (_command, ctx) => await this.runResume(ctx) },
     stop: { run: async (_command, ctx) => await this.runStop(ctx) },
     cancel: { run: async (_command, ctx) => await this.runCancel(ctx) },
+    new: { run: async (_command, ctx) => await this.runNew(ctx) },
     status: { run: async (_command, ctx) => await this.runStatus(ctx) },
     fast: { runtimeChange: true, run: async (command, ctx) => await this.runFast(command, ctx) },
     model: { runtimeChange: true, run: async (command, ctx) => await this.runSelect(command, ctx) },
     effort: { runtimeChange: true, run: async (command, ctx) => await this.runSelect(command, ctx) },
     permission: { runtimeChange: true, run: async (command, ctx) => await this.runSelect(command, ctx) },
     queue: { run: async (command, ctx) => await this.runQueue(command, ctx) }
+  }
+
+  /** `!new` starts a fresh context without cancelling already admitted work.
+   * Append sessions advance only the reservation observed by this command; a
+   * simultaneous command that saw the same coordinate loses the CAS and must
+   * not advance a second time. Per-thread sessions retain their identity and
+   * workspace, but forget the runtime and set a replay boundary at the command. */
+  private async runNew(ctx: CommandContext): Promise<boolean> {
+    const { msg, target, key, rec, inflight, reply } = ctx
+    const coordinates = await this.host.resolveSessionCoordinates(target.agentId, msg, target.integrationId)
+    const append = coordinates.sessionThread !== coordinates.deliveryThread
+    if (!append && inflight) {
+      reply('This session is still running. Use `!cancel` first, then `!new` to clear its context.')
+      return true
+    }
+    if (append) {
+      const advanced = await this.host
+        .store()
+        .advanceAppendReservation(
+          target.agentId,
+          msg.channel,
+          msg.transportScope ?? '',
+          coordinates.sessionThread,
+          Date.now(),
+          msg.msgId
+        )
+      if (!advanced) {
+        reply('No continuous conversation exists here yet — send a message first.')
+        return true
+      }
+      if (!advanced.advanced) {
+        reply('A concurrent `!new` already started the next continuous conversation.')
+        return true
+      }
+      // Materialize the successor before the next delivery. It remains runtime-
+      // cold; the next real message is the one that opens it and pins its host.
+      const successorKey = sessionKey(
+        msg.platform,
+        msg.channel,
+        advanced.coordinate,
+        target.agentId,
+        msg.transportScope
+      )
+      await this.host.store().upsertSession({
+        key: successorKey,
+        agentId: target.agentId,
+        platform: msg.platform,
+        channel: msg.channel,
+        thread: advanced.coordinate,
+        transportScope: msg.transportScope ?? null,
+        acpSessionId: null,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: Date.now(),
+        ...(rec?.workspaceIsolation ? { workspaceIsolation: rec.workspaceIsolation } : {}),
+        ...(rec?.memoryProvider ? { memoryProvider: rec.memoryProvider } : {})
+      })
+      await this.recordResetAudit(target.agentId, msg, coordinates.sessionThread, 'Continuous conversation reset')
+      await this.recordResetAudit(target.agentId, msg, advanced.coordinate, 'Continuous conversation started')
+      this.logSessionAction('new', key, senderActor(msg))
+      reply('Started a new continuous conversation for this agent. Earlier work continues in its original thread.')
+      return true
+    }
+    if (!rec) {
+      reply('No active session here yet — send a message to start one.')
+      return true
+    }
+    const host = rec.acpSessionId ? this.host.hostForSession(target.agentId, key) : undefined
+    if (rec.acpSessionId) host?.forgetSession(rec.acpSessionId)
+    await this.host.store().upsertSession({
+      ...rec,
+      acpSessionId: null,
+      state: 'idle',
+      // The reset command is deliberately not a prompt/transcript row. This
+      // cursor makes the next prompt begin after the command rather than replay
+      // the previous conversation into its fresh runtime session.
+      lastDeliveredTs: transcriptCoords(msg, coordinates).ts,
+      updatedAt: Date.now()
+    })
+    await this.recordResetAudit(target.agentId, msg, coordinates.sessionThread, 'Session context reset')
+    this.logSessionAction('new', key, senderActor(msg))
+    reply('Started a fresh context in this thread. Your workspace and session link are unchanged.')
+    return true
+  }
+
+  /** Reset events are daemon-authored transcript activity, never user prompt
+   * context: the console can audit them while replay filters the agent's own
+   * non-text rows. */
+  private async recordResetAudit(
+    agentId: string,
+    msg: NormalizedMessage,
+    sessionThread: string,
+    text: string
+  ): Promise<void> {
+    await this.host.store().appendTranscript({
+      channel: transcriptChannelKey(msg.channel, msg.transportScope),
+      thread: sessionThread,
+      ts: monotonicTs(),
+      sender: agentId,
+      kind: 'reasoning',
+      text,
+      orgAgentId: agentId
+    })
   }
 
   /** `!resume` — reset the latched conversation loop guard and clear a standing thread mute. */
@@ -633,9 +742,24 @@ export class CommandHandlers {
     return true
   }
 
-  /** `!stop` — interrupt any in-flight turn AND mute the thread until the agent is @mentioned again. */
+  /** `!stop` — interrupt any in-flight turn and, for per-thread sessions, mute until mentioned again. */
   private async runStop(ctx: CommandContext): Promise<boolean> {
-    const { target, key, rec, acpSessionId, inflight, reply } = ctx
+    const { msg, target, key, rec, acpSessionId, inflight, reply } = ctx
+    const coordinates = await this.host.resolveSessionCoordinates(target.agentId, msg, target.integrationId)
+    // A mute is scoped to a physical thread, but append has one logical session
+    // across the entire conversation. Treat !stop there as !cancel rather than
+    // silently suppressing every future unmentioned message in the room.
+    if (coordinates.sessionThread !== coordinates.deliveryThread) {
+      if (!inflight) {
+        reply('Nothing is running to stop. Continuous conversation remains active.')
+        return true
+      }
+      await this.host.interruptTurn(target.agentId, key, 'stop', acpSessionId ?? undefined, {
+        actor: senderActor(msg)
+      })
+      reply('🛑 Stopped. Continuous conversation remains active.')
+      return true
+    }
     // Mute the session's thread whether or not a turn is in flight: `!stop` is an
     // explicit stand-down — implicit routing (thread affinity / keyword / auto)
     // stays off until the user @mentions the agent again (onInbound clears it).

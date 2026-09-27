@@ -17,7 +17,14 @@ export default defineConfig({
     environment: 'node',
     include: [
       'test/local-store.test.ts',
+      'test/append-reservation-store.test.ts',
       'test/session-executor-store.test.ts',
+      'test/standing-work-store.test.ts',
+      // The execution-audit outbox is read by a drain query with an `IN (…)` agent fence, so its
+      // SQL has to run on the pool store and not only on SQLite.
+      'test/execution-audit.test.ts',
+      'test/execution-governance-store.test.ts',
+      'test/execution-audit-flush.test.ts',
       'test/memory-entries.test.ts',
       'test/store-concurrency.test.ts',
       'test/memory-capture-outbox.test.ts',

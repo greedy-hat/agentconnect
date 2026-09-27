@@ -7,7 +7,12 @@ import {
   integrationRouting,
   type CpRule
 } from '../src/router/routing-rule.js'
-import { configuredBotSelfId, integrationConfig, integrationCore } from '../src/platforms/integration-config.js'
+import {
+  configuredBotSelfId,
+  integrationConfig,
+  integrationCore,
+  integrationSessionMode
+} from '../src/platforms/integration-config.js'
 import type { Agent, Integration } from '../src/agents/agent-schema.js'
 
 function agent(over: Partial<Agent> = {}): Agent {
@@ -34,6 +39,16 @@ function agent(over: Partial<Agent> = {}): Agent {
 
 describe('integrationRouting (§6.4 core-envelope read)', () => {
   const bindRules = [{ channel: 'C1', match: { kind: 'mention' as const } }]
+  it('reads append only for the configured channel and defaults every other channel to createNew', () => {
+    const int = {
+      id: 'i-session',
+      platform: 'slack',
+      core: { sessionModes: [{ channel: 'C1', mode: 'append' }] }
+    } as Integration
+    expect(integrationSessionMode(int, 'C1')).toBe('append')
+    expect(integrationSessionMode(int, 'C2')).toBe('createNew')
+    expect(integrationSessionMode({ ...int, core: {} } as Integration, 'C1')).toBe('createNew')
+  })
   // One row per platform, each with the SAME core envelope but its own opaque
   // config payload and its own name for the bot's id. The expected values are
   // today's, read from the four arms this replaced.

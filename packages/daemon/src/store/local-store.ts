@@ -19,6 +19,7 @@ import {
 } from '@agentconnect.md/protocol'
 import type { NoteProjectionOutcome, NoteProjectionPhase, NoteProjectionRow } from '../gitlab/note-projection.js'
 import type { ReviewIntentRow } from '../gitlab/review-adapter.js'
+import { redactAuditDetails } from '../execution/governance.js'
 import { SESSION_TITLE_TOOL_TITLES } from '../mcp/session-title-tool.js'
 import type { ScheduleRun } from '../scheduler/scheduler.js'
 import { AsyncMutex } from './async-mutex.js'
@@ -568,6 +569,11 @@ export interface InboxRow {
   id: string
   sessionKey: string
   agentId: string
+  /** Trusted coordinates resolved when this delivery was admitted. They are
+   * deliberately separate from `msg`: provider input must never select the
+   * logical session used on crash replay. Null is the pre-coordinate shape. */
+  deliveryThread?: string | null
+  sessionThread?: string | null
   /** JSON.stringify(NormalizedMessage). */
   msg: string
   integrationId?: string | null
@@ -721,6 +727,100 @@ export interface MemoryCaptureOutboxStats {
   activeCount: number
   activeBytes: number
   oldestActiveAt?: number
+}
+
+export type StandingWorkLifecycle = 'active' | 'paused' | 'completed' | 'expired' | 'cancelled'
+export type StandingWorkRunStatus = 'pending' | 'running' | 'failed' | 'no_change' | 'notify' | 'blocked' | 'complete'
+
+export interface StandingWorkRow {
+  orgId: string
+  workId: string
+  agentId: string
+  principalId: string
+  name: string
+  objective: string
+  state: StandingWorkLifecycle
+  definitionVersion: number
+  schedule: string
+  timezone: string
+  scheduleMode: 'fixed' | 'adaptive'
+  maxIntervalSeconds: number
+  wakeOnConversation: boolean
+  /** Serialized CP-authorized context source; absent on legacy rows. */
+  conversationRefJson?: string | null
+  targetDestination: string
+  expiresAt: number
+  maxRunsPerDay: number
+  maxNotificationsPerDay: number
+  approvalVersion: number | null
+  approvalState: 'pending' | 'approved' | 'denied'
+  authorizationRevision: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface StandingWorkStateRow {
+  orgId: string
+  workId: string
+  appliedDefinitionVersion: number
+  nextCheckAt: number
+  lastRunAt: number | null
+  lastNotifiedAt: number | null
+  contextCursor: string | null
+  observationState: string
+  observationSchemaVersion: number
+  executionEpoch: number
+  leaseOwner: string | null
+  leaseExpiresAt: number | null
+  blockedReason: string | null
+  suggestedNextCheckAt: number | null
+  wakeSource: 'scheduled' | 'conversation'
+}
+
+export interface StandingWorkRunRow {
+  orgId: string
+  workId: string
+  runId: string
+  definitionVersion: number
+  occurrenceId: string
+  dueAt: number
+  executionEpoch: number
+  attempt: number
+  status: StandingWorkRunStatus
+  startedAt: number | null
+  finishedAt: number | null
+  outcome: string | null
+  sessionId: string | null
+  budgetReservationId: string | null
+  errorCode: string | null
+  wakeSource: 'scheduled' | 'conversation'
+  suggestedNextCheckAt: number | null
+}
+
+export interface StandingWorkNotificationRow {
+  orgId: string
+  workId: string
+  runId: string
+  notificationIndex: number
+  effectId: string
+  definitionVersion: number
+  authorizationRevision: number
+  destination: string
+  payload: string
+  payloadHash: string
+  status: 'pending' | 'sending' | 'delivered' | 'uncertain' | 'failed' | 'suppressed'
+  attempt: number
+  nextAttemptAt: number | null
+  providerReceipt: string | null
+  lastError: string | null
+}
+
+export interface StandingWorkContextRow {
+  seq: number
+  thread: string
+  ts: string | null
+  sender: string
+  text: string
 }
 
 /** Durable, non-secret record of a CP remote webchat MCP grant authority held by
@@ -920,6 +1020,34 @@ function restrictPath(path: string, mode: number): void {
   }
 }
 
+// Which agents are active in a PHYSICAL thread (channel-session-mode.md §6.4). The session
+// row answered this while a session WAS a thread; `append` puts a session at a coordinate
+// that is no thread's, so the question needs its own record. `sessionKey` is what the
+// affinity lookups join back to, so liveness stays the session's property, decided in one place.
+const THREAD_PARTICIPATION_SCHEMA = `
+      CREATE TABLE IF NOT EXISTS thread_participation (
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        transportScope TEXT NOT NULL DEFAULT '',
+        sessionKey TEXT NOT NULL,
+        updatedAt INTEGER,
+        PRIMARY KEY (channel, thread, agentId, transportScope)
+      );
+      CREATE INDEX IF NOT EXISTS thread_participation_session ON thread_participation (sessionKey);
+`
+
+// Seeds affinity from the sessions that predate the table. It must START with the INSERT:
+// the PostgreSQL rewrite converts `INSERT OR IGNORE` only when it opens the statement, so
+// folding this into the CREATE above would ship SQLite syntax to a pool store. The NOT NULL
+// filter makes both dialects skip the same legacy rows — SQLite's OR IGNORE swallows a NOT
+// NULL violation, PostgreSQL's ON CONFLICT covers only unique ones.
+export const THREAD_PARTICIPATION_BACKFILL = `
+      INSERT OR IGNORE INTO thread_participation (channel, thread, agentId, transportScope, sessionKey, updatedAt)
+      SELECT channel, thread, agentId, COALESCE(transportScope, ''), key, updatedAt FROM sessions
+      WHERE channel IS NOT NULL AND thread IS NOT NULL AND agentId IS NOT NULL
+`
+
 /**
  * Schema version a freshly created database is stamped with. Bump it in the same
  * change that edits a `CREATE TABLE` below, and append the matching step to
@@ -928,7 +1056,87 @@ function restrictPath(path: string, mode: number): void {
  * fresh databases and every established one fails at query time. `SCHEMA_MIGRATIONS`
  * asserts the two stay in lockstep for exactly that reason.
  */
-const SCHEMA_VERSION = 20
+const SCHEMA_VERSION = 31
+
+const DAY_MS = 86_400_000
+
+/** [localMidnight, nextLocalMidnight) in epoch ms for the definition's policy timezone; UTC-midnight fallback. */
+function policyDayWindow(timeZone: string, ts: number): { start: number; end: number } {
+  let offset = 0
+  try {
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        hourCycle: 'h23',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      })
+        .formatToParts(new Date(ts))
+        .map((p) => [p.type, p.value])
+    )
+    const asUtc = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second)
+    )
+    offset = asUtc - Math.floor(ts / 1000) * 1000
+  } catch {
+    /* fall back to the UTC day */
+  }
+  const start = Math.floor((ts + offset) / DAY_MS) * DAY_MS - offset
+  return { start, end: start + DAY_MS }
+}
+
+// Standing Work is deliberately daemon-store data.  A pool must use this shared
+// store (or a fenced transfer), never one SQLite file per member.
+const STANDING_WORK_SCHEMA = `
+      CREATE TABLE IF NOT EXISTS standing_work (
+        orgId TEXT NOT NULL, workId TEXT NOT NULL, agentId TEXT NOT NULL, principalId TEXT NOT NULL,
+        name TEXT NOT NULL, objective TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('active','paused','completed','expired','cancelled')),
+        definitionVersion INTEGER NOT NULL, schedule TEXT NOT NULL, timezone TEXT NOT NULL,
+        scheduleMode TEXT NOT NULL DEFAULT 'fixed' CHECK (scheduleMode IN ('fixed','adaptive')),
+        maxIntervalSeconds INTEGER NOT NULL DEFAULT 86400,
+        wakeOnConversation INTEGER NOT NULL DEFAULT 0,
+        conversationRefJson TEXT, targetDestination TEXT NOT NULL,
+        expiresAt INTEGER NOT NULL, maxRunsPerDay INTEGER NOT NULL, maxNotificationsPerDay INTEGER NOT NULL,
+        approvalVersion INTEGER, approvalState TEXT NOT NULL CHECK (approvalState IN ('pending','approved','denied')),
+        authorizationRevision INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (orgId, workId)
+      );
+      CREATE TABLE IF NOT EXISTS standing_work_state (
+        orgId TEXT NOT NULL, workId TEXT NOT NULL, appliedDefinitionVersion INTEGER NOT NULL, nextCheckAt INTEGER NOT NULL,
+        lastRunAt INTEGER, lastNotifiedAt INTEGER, contextCursor TEXT, observationState TEXT NOT NULL DEFAULT '{}',
+        observationSchemaVersion INTEGER NOT NULL DEFAULT 1, executionEpoch INTEGER NOT NULL DEFAULT 0,
+        leaseOwner TEXT, leaseExpiresAt INTEGER, blockedReason TEXT,
+        suggestedNextCheckAt INTEGER, wakeSource TEXT NOT NULL DEFAULT 'scheduled',
+        PRIMARY KEY (orgId, workId)
+      );
+      CREATE INDEX IF NOT EXISTS standing_work_due ON standing_work_state (nextCheckAt, leaseExpiresAt);
+      CREATE TABLE IF NOT EXISTS standing_work_run (
+        orgId TEXT NOT NULL, workId TEXT NOT NULL, runId TEXT NOT NULL, definitionVersion INTEGER NOT NULL,
+        occurrenceId TEXT NOT NULL, dueAt INTEGER NOT NULL, executionEpoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending','running','failed','no_change','notify','blocked','complete')),
+        startedAt INTEGER, finishedAt INTEGER, outcome TEXT, sessionId TEXT, budgetReservationId TEXT, errorCode TEXT,
+        wakeSource TEXT NOT NULL DEFAULT 'scheduled', suggestedNextCheckAt INTEGER,
+        PRIMARY KEY (orgId, workId, runId), UNIQUE (orgId, workId, definitionVersion, occurrenceId)
+      );
+      CREATE INDEX IF NOT EXISTS standing_work_run_active ON standing_work_run (orgId, workId, status);
+      CREATE TABLE IF NOT EXISTS standing_work_notification_outbox (
+        orgId TEXT NOT NULL, workId TEXT NOT NULL, runId TEXT NOT NULL, notificationIndex INTEGER NOT NULL,
+        effectId TEXT NOT NULL, definitionVersion INTEGER NOT NULL, authorizationRevision INTEGER NOT NULL, destination TEXT NOT NULL, payload TEXT NOT NULL,
+        payloadHash TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending','sending','delivered','uncertain','failed','suppressed')),
+        attempt INTEGER NOT NULL DEFAULT 0, nextAttemptAt INTEGER, providerReceipt TEXT, lastError TEXT,
+        PRIMARY KEY (orgId, runId, notificationIndex), UNIQUE (orgId, effectId)
+      );
+      CREATE INDEX IF NOT EXISTS standing_work_notification_pending ON standing_work_notification_outbox (status, nextAttemptAt);
+`
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -1114,7 +1322,115 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean }) => Promise<v
     await db.exec(`
       ALTER TABLE sessions ADD COLUMN executorDaemonId TEXT;
       ALTER TABLE sessions ADD COLUMN stayedHomeReason TEXT;
-    `)
+    `),
+  // Append reservation and its durable high-water mark are emitted by the CREATE block.
+  async () => undefined,
+  // Thread participation (channel-session-mode.md §6.4), backfilled from the session rows
+  // it replaces: an upgraded daemon must not lose continuity for every existing session.
+  async (db) => {
+    // Two execs on purpose: the PostgreSQL rewrite only converts `INSERT OR IGNORE` when
+    // it STARTS the statement, so folding this into the CREATE would ship SQLite syntax.
+    await db.exec(THREAD_PARTICIPATION_SCHEMA)
+    await db.exec(THREAD_PARTICIPATION_BACKFILL)
+  },
+  // An admitted row must retain its resolved coordinates. Legacy nulls are
+  // deliberately replayed with the old per-thread interpretation.
+  async (db) => {
+    // Fixture and operator repairs can leave a database stamped with an older
+    // version while already carrying either column. Treat precisely that state
+    // as already migrated; do not mask any other schema failure.
+    for (const column of ['deliveryThread', 'sessionThread']) {
+      try {
+        await db.exec(`ALTER TABLE inbox ADD COLUMN ${column} TEXT`)
+      } catch (error) {
+        if (!/duplicate column|already exists/i.test(String(error))) throw error
+      }
+    }
+  },
+  // A provider may redeliver a command after its first acknowledgement was
+  // lost. Record the command event so that retry cannot advance another
+  // append generation.
+  async (db) =>
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS append_session_reset_command (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        commandId TEXT NOT NULL, coordinate TEXT NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope, commandId)
+      );
+    `),
+  async (db) =>
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS execution_quota_account (
+        orgId TEXT NOT NULL, scope TEXT NOT NULL, limitAmount INTEGER NOT NULL, reservedAmount INTEGER NOT NULL DEFAULT 0,
+        spentAmount INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER NOT NULL, PRIMARY KEY (orgId, scope)
+      );
+      CREATE TABLE IF NOT EXISTS execution_quota_reservation (
+        id TEXT PRIMARY KEY, orgId TEXT NOT NULL, scope TEXT NOT NULL, amount INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'settled', 'released')),
+        actualAmount INTEGER, createdAt INTEGER NOT NULL, settledAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS execution_quota_reservation_scope ON execution_quota_reservation (orgId, scope, status);
+      CREATE TABLE IF NOT EXISTS execution_audit_outbox (
+        eventId TEXT NOT NULL, orgId TEXT NOT NULL, event TEXT NOT NULL, createdAt INTEGER NOT NULL, acknowledgedAt INTEGER,
+        PRIMARY KEY (orgId, eventId)
+      );
+      CREATE INDEX IF NOT EXISTS execution_audit_outbox_pending ON execution_audit_outbox (orgId, acknowledgedAt, createdAt);
+    `),
+  async (db) => await db.exec(STANDING_WORK_SCHEMA),
+  async (db) => {
+    for (const [table, column, declaration] of [
+      ['standing_work', 'conversationRefJson', 'TEXT'],
+      ['standing_work_notification_outbox', 'authorizationRevision', 'INTEGER NOT NULL DEFAULT 0']
+    ] as const) {
+      try {
+        await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`)
+      } catch (error) {
+        if (!/duplicate column|already exists/i.test(String(error))) throw error
+      }
+    }
+  },
+  async (db) => {
+    for (const [column, declaration] of [
+      ['scheduleMode', "TEXT NOT NULL DEFAULT 'fixed'"],
+      ['maxIntervalSeconds', 'INTEGER NOT NULL DEFAULT 86400']
+    ] as const) {
+      try {
+        await db.exec(`ALTER TABLE standing_work ADD COLUMN ${column} ${declaration}`)
+      } catch (error) {
+        if (!/duplicate column|already exists/i.test(String(error))) throw error
+      }
+    }
+  },
+  async (db) => {
+    try {
+      await db.exec(`ALTER TABLE standing_work ADD COLUMN wakeOnConversation INTEGER NOT NULL DEFAULT 0`)
+    } catch (error) {
+      if (!/duplicate column|already exists/i.test(String(error))) throw error
+    }
+  },
+  async (db) => {
+    for (const [table, column, declaration] of [
+      ['standing_work_state', 'suggestedNextCheckAt', 'INTEGER'],
+      ['standing_work_state', 'wakeSource', "TEXT NOT NULL DEFAULT 'scheduled'"],
+      ['standing_work_run', 'wakeSource', "TEXT NOT NULL DEFAULT 'scheduled'"],
+      ['standing_work_run', 'suggestedNextCheckAt', 'INTEGER']
+    ] as const) {
+      try {
+        await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`)
+      } catch (error) {
+        if (!/duplicate column|already exists/i.test(String(error))) throw error
+      }
+    }
+  },
+  // A row an older daemon wrote names no agent, so the drain can never claim it — which is the
+  // right outcome for a fact this release never learned to flush. `''` keeps it inert and NOT NULL.
+  async (db) => {
+    try {
+      await db.exec(`ALTER TABLE execution_audit_outbox ADD COLUMN agentId TEXT NOT NULL DEFAULT ''`)
+    } catch (error) {
+      if (!/duplicate column|already exists/i.test(String(error))) throw error
+    }
+  }
 ]
 
 // The list and the version are two halves of one fact: step `i` moves a database from
@@ -1231,6 +1547,42 @@ export class LocalStore {
         platformStanding TEXT,
         executorDaemonId TEXT, stayedHomeReason TEXT
       );
+      CREATE TABLE IF NOT EXISTS append_session_reservation (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        coordinate TEXT NOT NULL, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope)
+      );
+      -- A cleared reservation must not let a backward clock reuse a surviving transcript coordinate.
+      CREATE TABLE IF NOT EXISTS append_session_clock (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        maxMillis INTEGER NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope)
+      );
+      CREATE TABLE IF NOT EXISTS append_session_reset_command (
+        agentId TEXT NOT NULL, channel TEXT NOT NULL, transportScope TEXT NOT NULL,
+        commandId TEXT NOT NULL, coordinate TEXT NOT NULL,
+        PRIMARY KEY (agentId, channel, transportScope, commandId)
+      );
+      CREATE TABLE IF NOT EXISTS execution_quota_account (
+        orgId TEXT NOT NULL, scope TEXT NOT NULL, limitAmount INTEGER NOT NULL, reservedAmount INTEGER NOT NULL DEFAULT 0,
+        spentAmount INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER NOT NULL, PRIMARY KEY (orgId, scope)
+      );
+      CREATE TABLE IF NOT EXISTS execution_quota_reservation (
+        id TEXT PRIMARY KEY, orgId TEXT NOT NULL, scope TEXT NOT NULL, amount INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'settled', 'released')),
+        actualAmount INTEGER, createdAt INTEGER NOT NULL, settledAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS execution_quota_reservation_scope ON execution_quota_reservation (orgId, scope, status);
+      CREATE TABLE IF NOT EXISTS execution_audit_outbox (
+        eventId TEXT NOT NULL, orgId TEXT NOT NULL, agentId TEXT NOT NULL DEFAULT '',
+        event TEXT NOT NULL, createdAt INTEGER NOT NULL, acknowledgedAt INTEGER,
+        PRIMARY KEY (orgId, eventId)
+      );
+      CREATE INDEX IF NOT EXISTS execution_audit_outbox_pending ON execution_audit_outbox (orgId, acknowledgedAt, createdAt);
+      -- The drain is agent-scoped: on a pool's shared outbox a member may only report rows about
+      -- the agents it serves, and must reach them without paging over its peers' backlog.
+      CREATE INDEX IF NOT EXISTS execution_audit_outbox_drain ON execution_audit_outbox (agentId, acknowledgedAt, createdAt);
+      ${STANDING_WORK_SCHEMA}
       -- A !stop can arrive while a cold session is still materializing, before the
       -- sessions row exists. Keep the mute independently keyed so that stop survives a
       -- daemon restart and is applied when the session row is eventually created.
@@ -1257,6 +1609,7 @@ export class LocalStore {
         updatedAt INTEGER,
         PRIMARY KEY (agentId, sessionKey)
       );
+      ${THREAD_PARTICIPATION_SCHEMA}
       -- Latest-wins session metadata awaiting a correlated CP persistence ACK.
       -- This is deliberately separate from sessions: an upgrade starts with an
       -- empty outbox and never treats historical session rows as pending work.
@@ -1383,6 +1736,7 @@ export class LocalStore {
         postId TEXT
       );
       CREATE INDEX IF NOT EXISTS transcript_thread_seq ON transcript (orgId, channel, thread, seq);
+      CREATE INDEX IF NOT EXISTS transcript_channel_seq ON transcript (orgId, channel, seq);
       -- Dedup conversational rows by platform ts (double-fired inbound / redelivery);
       -- internal events have no platform ts and are intentionally never deduped here.
       CREATE UNIQUE INDEX IF NOT EXISTS transcript_text_ts
@@ -1445,6 +1799,8 @@ export class LocalStore {
         id TEXT PRIMARY KEY,
         sessionKey TEXT NOT NULL,
         agentId TEXT NOT NULL,
+        deliveryThread TEXT,
+        sessionThread TEXT,
         msg TEXT NOT NULL,
         integrationId TEXT,
         callMeta TEXT,
@@ -1845,6 +2201,1073 @@ export class LocalStore {
   private async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
     await this.drainToolCallWrites()
     return this.backend.transaction(fn)
+  }
+
+  /** Resolve one conversation's append coordinate before inbox admission. The row is authoritative
+   *  even before a sessions row exists; competing first messages read the same insert winner. */
+  async resolveAppendReservation(
+    agentId: string,
+    channel: string,
+    transportScope = '',
+    now = Date.now()
+  ): Promise<string> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const existing = (await tx
+        .prepare(
+          'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+        )
+        .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+      if (existing) return existing.coordinate
+      const previous = (await tx
+        .prepare('SELECT maxMillis FROM append_session_clock WHERE agentId = ? AND channel = ? AND transportScope = ?')
+        .get(agentId, channel, transportScope)) as { maxMillis: number } | undefined
+      const millis = Math.max(now, Number(previous?.maxMillis ?? 0) + 1)
+      const proposed = `append:${millis}`
+      const inserted = await tx
+        .prepare(
+          `INSERT OR IGNORE INTO append_session_reservation
+           (agentId, channel, transportScope, coordinate, updatedAt) VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(agentId, channel, transportScope, proposed, now)
+      if (Number(inserted.changes) > 0) {
+        await tx
+          .prepare(
+            `INSERT INTO append_session_clock (agentId, channel, transportScope, maxMillis)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (agentId, channel, transportScope) DO UPDATE SET maxMillis = excluded.maxMillis`
+          )
+          .run(agentId, channel, transportScope, millis)
+        return proposed
+      }
+      const winner = (await tx
+        .prepare(
+          'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+        )
+        .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+      if (!winner) throw new Error('append reservation disappeared during resolution')
+      return winner.coordinate
+    })
+  }
+
+  /** CAS rotation for !new. A losing caller reads the winner and never advances again. */
+  async advanceAppendReservation(
+    agentId: string,
+    channel: string,
+    transportScope: string,
+    expected: string,
+    now = Date.now(),
+    commandId?: string
+  ): Promise<{ coordinate: string; advanced: boolean; duplicate?: boolean } | undefined> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      if (commandId) {
+        const prior = (await tx
+          .prepare(
+            `SELECT coordinate FROM append_session_reset_command
+             WHERE agentId = ? AND channel = ? AND transportScope = ? AND commandId = ?`
+          )
+          .get(agentId, channel, transportScope, commandId)) as { coordinate: string } | undefined
+        if (prior) return { coordinate: prior.coordinate, advanced: false, duplicate: true }
+      }
+      const remember = async (coordinate: string): Promise<void> => {
+        if (!commandId) return
+        await tx
+          .prepare(
+            `INSERT OR IGNORE INTO append_session_reset_command
+             (agentId, channel, transportScope, commandId, coordinate) VALUES (?, ?, ?, ?, ?)`
+          )
+          .run(agentId, channel, transportScope, commandId, coordinate)
+      }
+      const current = (await tx
+        .prepare(
+          'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+        )
+        .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+      if (!current) return undefined
+      if (current.coordinate !== expected) {
+        await remember(current.coordinate)
+        return { coordinate: current.coordinate, advanced: false }
+      }
+      const previous = (await tx
+        .prepare('SELECT maxMillis FROM append_session_clock WHERE agentId = ? AND channel = ? AND transportScope = ?')
+        .get(agentId, channel, transportScope)) as { maxMillis: number } | undefined
+      const millis = Math.max(now, Number(previous?.maxMillis ?? 0) + 1)
+      const coordinate = `append:${millis}`
+      const updated = await tx
+        .prepare(
+          `UPDATE append_session_reservation SET coordinate = ?, updatedAt = ?
+           WHERE agentId = ? AND channel = ? AND transportScope = ? AND coordinate = ?`
+        )
+        .run(coordinate, now, agentId, channel, transportScope, expected)
+      if (Number(updated.changes) === 0) {
+        const winner = (await tx
+          .prepare(
+            'SELECT coordinate FROM append_session_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?'
+          )
+          .get(agentId, channel, transportScope)) as { coordinate: string } | undefined
+        if (!winner) return undefined
+        await remember(winner.coordinate)
+        return { coordinate: winner.coordinate, advanced: false }
+      }
+      await tx
+        .prepare(
+          `INSERT INTO append_session_clock (agentId, channel, transportScope, maxMillis)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (agentId, channel, transportScope) DO UPDATE SET maxMillis = excluded.maxMillis`
+        )
+        .run(agentId, channel, transportScope, millis)
+      await remember(coordinate)
+      return { coordinate, advanced: true }
+    })
+  }
+
+  /** Atomically reserve a bounded allowance. Reusing an id is idempotent; a different policy cap fails closed. */
+  async reserveExecutionQuota(
+    id: string,
+    orgId: string,
+    scope: string,
+    amount: number,
+    limitAmount: number,
+    now = Date.now()
+  ): Promise<'reserved' | 'denied' | 'conflict'> {
+    if (
+      !id ||
+      !orgId ||
+      !scope ||
+      !Number.isSafeInteger(amount) ||
+      amount < 0 ||
+      !Number.isSafeInteger(limitAmount) ||
+      limitAmount < 0
+    )
+      throw new Error('invalid execution quota reservation')
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const prior = (await tx
+        .prepare('SELECT orgId, scope, amount FROM execution_quota_reservation WHERE id = ?')
+        .get(id)) as { orgId: string; scope: string; amount: number } | undefined
+      if (prior)
+        return prior.orgId === orgId && prior.scope === scope && Number(prior.amount) === amount
+          ? 'reserved'
+          : 'conflict'
+      await tx
+        .prepare(
+          `INSERT INTO execution_quota_account (orgId, scope, limitAmount, reservedAmount, spentAmount, updatedAt) VALUES (?, ?, ?, 0, 0, ?) ON CONFLICT (orgId, scope) DO NOTHING`
+        )
+        .run(orgId, scope, limitAmount, now)
+      const claimed = await tx
+        .prepare(
+          `UPDATE execution_quota_account SET reservedAmount = reservedAmount + ?, updatedAt = ? WHERE orgId = ? AND scope = ? AND limitAmount = ? AND reservedAmount + spentAmount + ? <= limitAmount`
+        )
+        .run(amount, now, orgId, scope, limitAmount, amount)
+      if (Number(claimed.changes) === 0) return 'denied'
+      await tx
+        .prepare(
+          `INSERT INTO execution_quota_reservation (id, orgId, scope, amount, status, createdAt) VALUES (?, ?, ?, ?, 'reserved', ?)`
+        )
+        .run(id, orgId, scope, amount, now)
+      return 'reserved'
+    })
+  }
+
+  /** Settle once; uncertain reservations deliberately remain reserved for reconciliation. */
+  async settleExecutionQuota(id: string, actualAmount: number, now = Date.now()): Promise<boolean> {
+    if (!Number.isSafeInteger(actualAmount) || actualAmount < 0) throw new Error('invalid execution quota settlement')
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const row = (await tx
+        .prepare('SELECT orgId, scope, amount, status FROM execution_quota_reservation WHERE id = ?')
+        .get(id)) as { orgId: string; scope: string; amount: number; status: string } | undefined
+      if (!row) return false
+      if (row.status !== 'reserved') return row.status === 'settled'
+      const actual = Math.min(actualAmount, Number(row.amount))
+      const changed = await tx
+        .prepare(
+          `UPDATE execution_quota_reservation SET status = 'settled', actualAmount = ?, settledAt = ? WHERE id = ? AND status = 'reserved'`
+        )
+        .run(actual, now, id)
+      if (Number(changed.changes) === 0) return false
+      await tx
+        .prepare(
+          `UPDATE execution_quota_account SET reservedAmount = reservedAmount - ?, spentAmount = spentAmount + ?, updatedAt = ? WHERE orgId = ? AND scope = ?`
+        )
+        .run(row.amount, actual, now, row.orgId, row.scope)
+      return true
+    })
+  }
+
+  /** Insert audit intent before an effect; event ids make retries safe. `agentId` is carried alongside
+   *  the org so a pool member can find its own rows without paging through its peers'. */
+  async appendExecutionAudit(
+    eventId: string,
+    orgId: string,
+    agentId: string,
+    event: unknown,
+    now = Date.now()
+  ): Promise<boolean> {
+    if (!eventId || !orgId) throw new Error('execution audit event id and org id are required')
+    const safeEvent =
+      event && typeof event === 'object' && !Array.isArray(event)
+        ? {
+            ...(event as Record<string, unknown>),
+            details: redactAuditDetails((event as { details?: Record<string, unknown> }).details)
+          }
+        : event
+    const result = await this.db
+      .prepare(
+        `INSERT INTO execution_audit_outbox (eventId, orgId, agentId, event, createdAt) VALUES (?, ?, ?, ?, ?) ON CONFLICT (orgId, eventId) DO NOTHING`
+      )
+      .run(eventId, orgId, agentId, JSON.stringify(safeEvent), now)
+    return Number(result.changes) > 0
+  }
+
+  async pendingExecutionAudit(
+    orgId: string,
+    limit: number
+  ): Promise<Array<{ eventId: string; event: unknown; createdAt: number }>> {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('execution audit limit must be positive')
+    const rows = (await this.db
+      .prepare(
+        `SELECT eventId, event, createdAt FROM execution_audit_outbox WHERE orgId = ? AND acknowledgedAt IS NULL ORDER BY createdAt, eventId LIMIT ?`
+      )
+      .all(orgId, limit)) as Array<{ eventId: string; event: string; createdAt: number }>
+    return rows.map((row) => ({ eventId: row.eventId, event: JSON.parse(row.event), createdAt: Number(row.createdAt) }))
+  }
+
+  /** One member's share of the audit outbox, oldest first. The agent is the ownership fence: a pool's
+   *  store holds every member's rows, and only the daemon serving an agent may report about it. */
+  async pendingExecutionAuditForAgents(
+    agentIds: readonly string[],
+    limit: number
+  ): Promise<Array<{ eventId: string; orgId: string; event: unknown }>> {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('execution audit limit must be positive')
+    if (agentIds.length === 0) return []
+    const unique = [...new Set(agentIds)]
+    const rows = (await this.db
+      .prepare(
+        `SELECT eventId, orgId, event FROM execution_audit_outbox
+         WHERE acknowledgedAt IS NULL AND agentId IN (${unique.map(() => '?').join(',')})
+         ORDER BY createdAt, eventId LIMIT ?`
+      )
+      .all(...unique, limit)) as Array<{ eventId: string; orgId: string; event: string }>
+    return rows.map((row) => ({ eventId: row.eventId, orgId: row.orgId, event: JSON.parse(row.event) }))
+  }
+
+  async acknowledgeExecutionAudit(eventId: string, orgId: string, now = Date.now()): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        'UPDATE execution_audit_outbox SET acknowledgedAt = ? WHERE eventId = ? AND orgId = ? AND acknowledgedAt IS NULL'
+      )
+      .run(now, eventId, orgId)
+    return Number(result.changes) > 0
+  }
+
+  /** Persist an approved-or-pending definition and its first authoritative due time together. */
+  async createStandingWork(work: StandingWorkRow, state: StandingWorkStateRow): Promise<boolean> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const inserted = await tx
+        .prepare(
+          `INSERT INTO standing_work (orgId, workId, agentId, principalId, name, objective, state, definitionVersion, schedule, timezone, scheduleMode, maxIntervalSeconds, wakeOnConversation, conversationRefJson, targetDestination, expiresAt, maxRunsPerDay, maxNotificationsPerDay, approvalVersion, approvalState, authorizationRevision, createdAt, updatedAt)
+         VALUES (@orgId, @workId, @agentId, @principalId, @name, @objective, @state, @definitionVersion, @schedule, @timezone, @scheduleMode, @maxIntervalSeconds, @wakeOnConversation, @conversationRefJson, @targetDestination, @expiresAt, @maxRunsPerDay, @maxNotificationsPerDay, @approvalVersion, @approvalState, @authorizationRevision, @createdAt, @updatedAt)
+         ON CONFLICT (orgId, workId) DO NOTHING`
+        )
+        .run({
+          ...work,
+          wakeOnConversation: work.wakeOnConversation ? 1 : 0,
+          conversationRefJson: work.conversationRefJson ?? null
+        } as unknown as SqlParams)
+      if (Number(inserted.changes) === 0) return false
+      await tx
+        .prepare(
+          `INSERT INTO standing_work_state (orgId, workId, appliedDefinitionVersion, nextCheckAt, lastRunAt, lastNotifiedAt, contextCursor, observationState, observationSchemaVersion, executionEpoch, leaseOwner, leaseExpiresAt, blockedReason, suggestedNextCheckAt, wakeSource)
+         VALUES (@orgId, @workId, @appliedDefinitionVersion, @nextCheckAt, @lastRunAt, @lastNotifiedAt, @contextCursor, @observationState, @observationSchemaVersion, @executionEpoch, @leaseOwner, @leaseExpiresAt, @blockedReason, @suggestedNextCheckAt, @wakeSource)`
+        )
+        .run(state as unknown as SqlParams)
+      return true
+    })
+  }
+
+  /**
+   * Reconcile one CP-authoritative projection into the durable execution core.  The control plane owns
+   * the definition, operator lifecycle, and approval; the daemon owns run execution state.  The CP is
+   * monotonic in `definitionVersion` (every edit/transition bumps it; only `approve` changes at parity),
+   * so version comparison settles which facts may be written:
+   *  - no local row → insert work + fresh execution state (`created`)
+   *  - incoming version > local → catch up edits the live frames missed: overwrite definition + lifecycle
+   *    + approval, re-fence the schedule, and clear the lease.  Execution epoch and observation survive,
+   *    and pending notifications for the retired version are suppressed (`replaced`)
+   *  - incoming version = local → mirror only same-version authority (approval, authorization revision);
+   *    run scheduling and a daemon-terminal state (completed/expired) are NEVER reopened by a snapshot (`noop`)
+   *  - incoming version < local → stale projection, ignored (`stale`)
+   */
+  async ingestStandingWork(
+    work: StandingWorkRow,
+    freshState: StandingWorkStateRow
+  ): Promise<'created' | 'replaced' | 'noop' | 'stale'> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const existing = (await tx
+        .prepare('SELECT definitionVersion, state FROM standing_work WHERE orgId = ? AND workId = ?')
+        .get(work.orgId, work.workId)) as { definitionVersion: number; state: StandingWorkLifecycle } | undefined
+      if (!existing) {
+        await tx
+          .prepare(
+            `INSERT INTO standing_work (orgId, workId, agentId, principalId, name, objective, state, definitionVersion, schedule, timezone, scheduleMode, maxIntervalSeconds, wakeOnConversation, conversationRefJson, targetDestination, expiresAt, maxRunsPerDay, maxNotificationsPerDay, approvalVersion, approvalState, authorizationRevision, createdAt, updatedAt)
+             VALUES (@orgId, @workId, @agentId, @principalId, @name, @objective, @state, @definitionVersion, @schedule, @timezone, @scheduleMode, @maxIntervalSeconds, @wakeOnConversation, @conversationRefJson, @targetDestination, @expiresAt, @maxRunsPerDay, @maxNotificationsPerDay, @approvalVersion, @approvalState, @authorizationRevision, @createdAt, @updatedAt)`
+          )
+          .run({
+            ...work,
+            wakeOnConversation: work.wakeOnConversation ? 1 : 0,
+            conversationRefJson: work.conversationRefJson ?? null
+          } as unknown as SqlParams)
+        await tx
+          .prepare(
+            `INSERT INTO standing_work_state (orgId, workId, appliedDefinitionVersion, nextCheckAt, lastRunAt, lastNotifiedAt, contextCursor, observationState, observationSchemaVersion, executionEpoch, leaseOwner, leaseExpiresAt, blockedReason, suggestedNextCheckAt, wakeSource)
+             VALUES (@orgId, @workId, @appliedDefinitionVersion, @nextCheckAt, @lastRunAt, @lastNotifiedAt, @contextCursor, @observationState, @observationSchemaVersion, @executionEpoch, @leaseOwner, @leaseExpiresAt, @blockedReason, @suggestedNextCheckAt, @wakeSource)`
+          )
+          .run(freshState as unknown as SqlParams)
+        return 'created'
+      }
+      if (work.definitionVersion < existing.definitionVersion) return 'stale'
+      if (work.definitionVersion === existing.definitionVersion) {
+        // Same version: only `approve`/authorization can differ, so mirror those and nothing that owns scheduling or the lease.
+        await tx
+          .prepare(
+            `UPDATE standing_work SET approvalState = @approvalState, approvalVersion = @approvalVersion, authorizationRevision = @authorizationRevision, updatedAt = @updatedAt
+             WHERE orgId = @orgId AND workId = @workId`
+          )
+          .run({
+            orgId: work.orgId,
+            workId: work.workId,
+            approvalState: work.approvalState,
+            approvalVersion: work.approvalVersion,
+            authorizationRevision: work.authorizationRevision,
+            updatedAt: work.updatedAt
+          } as SqlParams)
+        return 'noop'
+      }
+      // A higher authoritative version: overwrite definition + lifecycle + approval, re-fence the occurrence,
+      // and drop the retired version's undelivered notifications.  The epoch survives so an in-flight old-version
+      // run's report is fenced out by the version check, not silently accepted.
+      await tx
+        .prepare(
+          `UPDATE standing_work SET agentId = @agentId, principalId = @principalId, name = @name, objective = @objective, state = @state,
+           definitionVersion = @definitionVersion, schedule = @schedule, timezone = @timezone, scheduleMode = @scheduleMode, maxIntervalSeconds = @maxIntervalSeconds,
+           conversationRefJson = @conversationRefJson, targetDestination = @targetDestination,
+           expiresAt = @expiresAt, maxRunsPerDay = @maxRunsPerDay, maxNotificationsPerDay = @maxNotificationsPerDay,
+           approvalVersion = @approvalVersion, approvalState = @approvalState, authorizationRevision = @authorizationRevision, updatedAt = @updatedAt
+           WHERE orgId = @orgId AND workId = @workId`
+        )
+        .run({
+          orgId: work.orgId,
+          workId: work.workId,
+          agentId: work.agentId,
+          principalId: work.principalId,
+          name: work.name,
+          objective: work.objective,
+          state: work.state,
+          definitionVersion: work.definitionVersion,
+          schedule: work.schedule,
+          timezone: work.timezone,
+          scheduleMode: work.scheduleMode,
+          maxIntervalSeconds: work.maxIntervalSeconds,
+          conversationRefJson: work.conversationRefJson ?? null,
+          targetDestination: work.targetDestination,
+          expiresAt: work.expiresAt,
+          maxRunsPerDay: work.maxRunsPerDay,
+          maxNotificationsPerDay: work.maxNotificationsPerDay,
+          approvalVersion: work.approvalVersion,
+          approvalState: work.approvalState,
+          authorizationRevision: work.authorizationRevision,
+          updatedAt: work.updatedAt
+        } as SqlParams)
+      await tx
+        .prepare(
+          `UPDATE standing_work_state SET appliedDefinitionVersion = @appliedDefinitionVersion, nextCheckAt = @nextCheckAt, leaseOwner = NULL, leaseExpiresAt = NULL
+           WHERE orgId = @orgId AND workId = @workId`
+        )
+        .run({
+          orgId: freshState.orgId,
+          workId: freshState.workId,
+          appliedDefinitionVersion: freshState.appliedDefinitionVersion,
+          nextCheckAt: freshState.nextCheckAt
+        } as SqlParams)
+      await tx
+        .prepare(
+          `UPDATE standing_work_notification_outbox SET status = 'suppressed', nextAttemptAt = NULL WHERE orgId = @orgId AND workId = @workId AND status IN ('pending','failed')`
+        )
+        .run({ orgId: work.orgId, workId: work.workId } as SqlParams)
+      return 'replaced'
+    })
+  }
+
+  private normalizeStandingWorkRow(row: any): StandingWorkRow {
+    return { ...row, wakeOnConversation: Boolean(row.wakeOnConversation) }
+  }
+
+  async getStandingWork(
+    orgId: string,
+    workId: string
+  ): Promise<{ work: StandingWorkRow; state: StandingWorkStateRow } | undefined> {
+    const work = (await this.db
+      .prepare('SELECT * FROM standing_work WHERE orgId = ? AND workId = ?')
+      .get(orgId, workId)) as any | undefined
+    if (!work) return undefined
+    const state = (await this.db
+      .prepare('SELECT * FROM standing_work_state WHERE orgId = ? AND workId = ?')
+      .get(orgId, workId)) as StandingWorkStateRow | undefined
+    return state ? { work: this.normalizeStandingWorkRow(work), state } : undefined
+  }
+
+  /** Bounded, cursor-free management projection.  It deliberately never returns another org's rows. */
+  async listStandingWork(
+    orgId: string,
+    limit = 100
+  ): Promise<Array<{ work: StandingWorkRow; state: StandingWorkStateRow }>> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new Error('invalid standing work list limit')
+    const rows = (await this.db
+      .prepare(
+        `SELECT w.*, s.appliedDefinitionVersion, s.nextCheckAt, s.lastRunAt, s.lastNotifiedAt, s.contextCursor, s.observationState, s.observationSchemaVersion, s.executionEpoch, s.leaseOwner, s.leaseExpiresAt, s.blockedReason
+       FROM standing_work w JOIN standing_work_state s ON s.orgId = w.orgId AND s.workId = w.workId
+       WHERE w.orgId = ? ORDER BY w.updatedAt DESC, w.workId LIMIT ?`
+      )
+      .all(orgId, limit)) as Array<any>
+    return rows.map((row) => ({ work: this.normalizeStandingWorkRow(row), state: row as StandingWorkStateRow }))
+  }
+
+  /** Console timeline: runs and notification delivery are separate facts, so uncertainty cannot be hidden. */
+  async standingWorkTimeline(
+    orgId: string,
+    workId: string,
+    limit = 100
+  ): Promise<{ runs: StandingWorkRunRow[]; notifications: StandingWorkNotificationRow[] }> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500)
+      throw new Error('invalid standing work timeline limit')
+    const runs = (await this.db
+      .prepare(
+        'SELECT * FROM standing_work_run WHERE orgId = ? AND workId = ? ORDER BY COALESCE(finishedAt, startedAt, dueAt) DESC, runId DESC LIMIT ?'
+      )
+      .all(orgId, workId, limit)) as StandingWorkRunRow[]
+    const notifications = (await this.db
+      .prepare(
+        'SELECT * FROM standing_work_notification_outbox WHERE orgId = ? AND workId = ? ORDER BY runId DESC, notificationIndex DESC LIMIT ?'
+      )
+      .all(orgId, workId, limit)) as StandingWorkNotificationRow[]
+    return { runs, notifications }
+  }
+
+  /** The run row a report is stamped from, by its unique id. */
+  async getStandingWorkRun(orgId: string, runId: string): Promise<StandingWorkRunRow | undefined> {
+    return (await this.db
+      .prepare('SELECT * FROM standing_work_run WHERE orgId = ? AND runId = ?')
+      .get(orgId, runId)) as StandingWorkRunRow | undefined
+  }
+
+  /** The run's latest notification, if its commit queued one — delivery is reported separately from outcome. */
+  async getStandingWorkNotification(orgId: string, runId: string): Promise<StandingWorkNotificationRow | undefined> {
+    return (await this.db
+      .prepare(
+        'SELECT * FROM standing_work_notification_outbox WHERE orgId = ? AND runId = ? ORDER BY notificationIndex DESC LIMIT 1'
+      )
+      .get(orgId, runId)) as StandingWorkNotificationRow | undefined
+  }
+
+  /**
+   * Terminal runs newest-first, each with its definition's owning agent and its latest notification —
+   * the feed the daemon re-asserts over `standing-work/report` on every (re)connect, so reports that
+   * fired while the CP was unreachable land rather than vanishing. The CP write is latest-wins.
+   */
+  async standingWorkReportFeed(
+    limit = 200
+  ): Promise<Array<{ run: StandingWorkRunRow; agentId: string; notification: StandingWorkNotificationRow | null }>> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500)
+      throw new Error('invalid standing work report feed limit')
+    const runs = (await this.db
+      .prepare(
+        `SELECT r.*, w.agentId AS agentId FROM standing_work_run r JOIN standing_work w ON w.orgId = r.orgId AND w.workId = r.workId
+       WHERE r.status IN ('no_change', 'notify', 'blocked', 'complete', 'failed')
+       ORDER BY COALESCE(r.finishedAt, r.startedAt, r.dueAt) DESC, r.runId DESC LIMIT ?`
+      )
+      .all(limit)) as Array<StandingWorkRunRow & { agentId: string }>
+    if (runs.length === 0) return []
+    const notes = (await this.db
+      .prepare(
+        `SELECT * FROM standing_work_notification_outbox WHERE runId IN (${runs.map(() => '?').join(', ')}) ORDER BY runId, notificationIndex`
+      )
+      .all(...runs.map((row) => row.runId))) as StandingWorkNotificationRow[]
+    const latest = new Map(notes.map((note) => [note.runId, note]))
+    return runs.map((row) => ({ run: row, agentId: row.agentId, notification: latest.get(row.runId) ?? null }))
+  }
+
+  /** Expiry is a durable lifecycle transition, not merely a scheduler filter. */
+  async expireStandingWork(now: number): Promise<number> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const changed = await tx
+        .prepare(
+          `UPDATE standing_work SET state = 'expired', definitionVersion = definitionVersion + 1, approvalState = 'pending', approvalVersion = NULL, updatedAt = ?
+         WHERE state IN ('active', 'paused') AND expiresAt <= ?`
+        )
+        .run(now, now)
+      if (Number(changed.changes) > 0)
+        await tx
+          .prepare(
+            `UPDATE standing_work_notification_outbox SET status = 'suppressed', nextAttemptAt = NULL
+           WHERE status IN ('pending', 'failed') AND EXISTS (
+             SELECT 1 FROM standing_work w WHERE w.orgId = standing_work_notification_outbox.orgId
+               AND w.workId = standing_work_notification_outbox.workId AND w.state = 'expired' AND w.expiresAt <= ?
+           )`
+          )
+          .run(now)
+      return Number(changed.changes)
+    })
+  }
+
+  /** A timer is only a wakeup: this persisted due list is authoritative after restart or handoff. */
+  async dueStandingWork(
+    now: number,
+    limit = 32
+  ): Promise<Array<{ work: StandingWorkRow; state: StandingWorkStateRow }>> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT w.*, s.appliedDefinitionVersion, s.nextCheckAt, s.lastRunAt, s.lastNotifiedAt, s.contextCursor, s.observationState, s.observationSchemaVersion, s.executionEpoch, s.leaseOwner, s.leaseExpiresAt, s.blockedReason
+       FROM standing_work w JOIN standing_work_state s ON s.orgId = w.orgId AND s.workId = w.workId
+       WHERE w.state = 'active' AND w.approvalState = 'approved' AND w.approvalVersion = w.definitionVersion AND w.expiresAt > ? AND s.nextCheckAt <= ? ORDER BY s.nextCheckAt LIMIT ?`
+      )
+      .all(now, now, limit)) as Array<any>
+    return rows.map((row) => ({ work: this.normalizeStandingWorkRow(row), state: row as StandingWorkStateRow }))
+  }
+
+  /** Lifecycle edits always advance the definition fence; old executors can no longer commit. */
+  async transitionStandingWork(
+    orgId: string,
+    workId: string,
+    expectedVersion: number,
+    state: StandingWorkLifecycle,
+    now: number
+  ): Promise<StandingWorkRow | undefined> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const changed = await tx
+        .prepare(
+          `UPDATE standing_work SET state = ?, definitionVersion = definitionVersion + 1, approvalState = 'pending', approvalVersion = NULL, updatedAt = ?
+         WHERE orgId = ? AND workId = ? AND definitionVersion = ?`
+        )
+        .run(state, now, orgId, workId, expectedVersion)
+      if (Number(changed.changes) === 0) return undefined
+      await tx
+        .prepare(
+          `UPDATE standing_work_state SET appliedDefinitionVersion = appliedDefinitionVersion + 1, leaseOwner = NULL, leaseExpiresAt = NULL
+         WHERE orgId = ? AND workId = ?`
+        )
+        .run(orgId, workId)
+      if (state === 'paused' || state === 'cancelled' || state === 'expired')
+        await tx
+          .prepare(
+            `UPDATE standing_work_notification_outbox SET status = 'suppressed', nextAttemptAt = NULL WHERE orgId = ? AND workId = ? AND status IN ('pending','failed')`
+          )
+          .run(orgId, workId)
+      return this.normalizeStandingWorkRow(
+        await tx.prepare('SELECT * FROM standing_work WHERE orgId = ? AND workId = ?').get(orgId, workId)
+      )
+    })
+  }
+
+  /** A definition replacement is fenced exactly like a lifecycle transition and always needs fresh approval. */
+  async updateStandingWork(
+    orgId: string,
+    workId: string,
+    expectedVersion: number,
+    patch: Pick<
+      StandingWorkRow,
+      | 'name'
+      | 'objective'
+      | 'schedule'
+      | 'timezone'
+      | 'scheduleMode'
+      | 'maxIntervalSeconds'
+      | 'wakeOnConversation'
+      | 'conversationRefJson'
+      | 'targetDestination'
+      | 'expiresAt'
+      | 'maxRunsPerDay'
+      | 'maxNotificationsPerDay'
+      | 'authorizationRevision'
+    >,
+    nextCheckAt: number,
+    now: number
+  ): Promise<StandingWorkRow | undefined> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const changed = await tx
+        .prepare(
+          `UPDATE standing_work SET name = @name, objective = @objective, schedule = @schedule, timezone = @timezone, scheduleMode = @scheduleMode, maxIntervalSeconds = @maxIntervalSeconds, wakeOnConversation = @wakeOnConversation,
+         conversationRefJson = @conversationRefJson, targetDestination = @targetDestination,
+         expiresAt = @expiresAt, maxRunsPerDay = @maxRunsPerDay, maxNotificationsPerDay = @maxNotificationsPerDay,
+         authorizationRevision = @authorizationRevision, definitionVersion = definitionVersion + 1, approvalState = 'pending', approvalVersion = NULL, updatedAt = @now
+         WHERE orgId = @orgId AND workId = @workId AND definitionVersion = @expectedVersion`
+        )
+        .run({
+          ...patch,
+          wakeOnConversation: patch.wakeOnConversation ? 1 : 0,
+          orgId,
+          workId,
+          expectedVersion,
+          now
+        } as SqlParams)
+      if (Number(changed.changes) === 0) return undefined
+      await tx
+        .prepare(
+          `UPDATE standing_work_state SET appliedDefinitionVersion = appliedDefinitionVersion + 1, nextCheckAt = ?, leaseOwner = NULL, leaseExpiresAt = NULL WHERE orgId = ? AND workId = ?`
+        )
+        .run(nextCheckAt, orgId, workId)
+      await tx
+        .prepare(
+          `UPDATE standing_work_notification_outbox SET status = 'suppressed', nextAttemptAt = NULL WHERE orgId = ? AND workId = ? AND status IN ('pending','failed')`
+        )
+        .run(orgId, workId)
+      return this.normalizeStandingWorkRow(
+        await tx.prepare('SELECT * FROM standing_work WHERE orgId = ? AND workId = ?').get(orgId, workId)
+      )
+    })
+  }
+
+  async approveStandingWork(orgId: string, workId: string, version: number, now: number): Promise<boolean> {
+    const changed = await this.db
+      .prepare(
+        `UPDATE standing_work SET approvalState = 'approved', approvalVersion = ?, updatedAt = ?
+       WHERE orgId = ? AND workId = ? AND definitionVersion = ? AND approvalState = 'pending'`
+      )
+      .run(version, now, orgId, workId, version)
+    return Number(changed.changes) === 1
+  }
+
+  /** Advance nextCheckAt to wake a work item for conversation events. Only advances if the work is
+   *  active, approved, and wakeOnConversation is enabled. Returns true if the wake was admitted. */
+  async wakeStandingWork(orgId: string, workId: string, nextCheckAt: number): Promise<boolean> {
+    const changed = await this.db
+      .prepare(
+        `UPDATE standing_work_state SET nextCheckAt = ?, wakeSource = 'conversation' WHERE orgId = ? AND workId = ? AND nextCheckAt > ?`
+      )
+      .run(nextCheckAt, orgId, workId, nextCheckAt)
+    return Number(changed.changes) === 1
+  }
+
+  /** List work items bound to a specific conversation with wakeOnConversation enabled. */
+  async listWakeableStandingWork(conversationRef: {
+    platform: string
+    integrationId: string
+    channel: string
+  }): Promise<Array<{ orgId: string; workId: string; agentId: string }>> {
+    const refJson = JSON.stringify(conversationRef)
+    const rows = (await this.db
+      .prepare(
+        `SELECT orgId, workId, agentId FROM standing_work WHERE state = 'active' AND approvalState = 'approved' AND wakeOnConversation = 1 AND conversationRefJson = ?`
+      )
+      .all(refJson)) as Array<{ orgId: string; workId: string; agentId: string }>
+    return rows
+  }
+
+  /** Claim one due occurrence under a fencing epoch.  The unique occurrence row is not treated as an execution lease. */
+  async claimStandingWorkRun(input: {
+    orgId: string
+    workId: string
+    definitionVersion: number
+    occurrenceId: string
+    dueAt: number
+    runId: string
+    ownerId: string
+    now: number
+    leaseMs: number
+  }): Promise<StandingWorkRunRow | undefined> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      // A new occurrence that has already spent today's run allowance is deferred to the next
+      // policy day, not retried on every pump tick; a retry of a live occurrence is exempt.
+      const quota = (await tx
+        .prepare(
+          `SELECT w.maxRunsPerDay AS max, w.timezone AS tz, EXISTS (SELECT 1 FROM standing_work_run r WHERE r.orgId = w.orgId AND r.workId = w.workId AND r.definitionVersion = w.definitionVersion AND r.occurrenceId = ?) AS "isRetry"
+         FROM standing_work w JOIN standing_work_state s ON s.orgId = w.orgId AND s.workId = w.workId WHERE w.orgId = ? AND w.workId = ?`
+        )
+        .get(input.occurrenceId, input.orgId, input.workId)) as { max: number; tz: string; isRetry: number } | undefined
+      if (quota && !quota.isRetry) {
+        const day = policyDayWindow(quota.tz, input.now)
+        const used = (await tx
+          .prepare(
+            `SELECT COUNT(*) AS c FROM standing_work_run WHERE orgId = ? AND workId = ? AND startedAt IS NOT NULL AND startedAt >= ? AND startedAt < ?`
+          )
+          .get(input.orgId, input.workId, day.start, day.end)) as { c: number }
+        if (used.c >= quota.max) {
+          await tx
+            .prepare(
+              `UPDATE standing_work_state SET nextCheckAt = ? WHERE orgId = ? AND workId = ? AND nextCheckAt <= ?`
+            )
+            .run(day.end, input.orgId, input.workId, input.now)
+          return undefined
+        }
+      }
+      // The state lease is the authority for a running attempt. Once it is past, make the
+      // interrupted attempt visibly failed before testing the one-active-run invariant.
+      await tx
+        .prepare(
+          `UPDATE standing_work_run SET status = 'failed', finishedAt = ?, errorCode = 'lease_expired'
+         WHERE orgId = ? AND workId = ? AND status = 'running'
+           AND EXISTS (SELECT 1 FROM standing_work_state s WHERE s.orgId = standing_work_run.orgId AND s.workId = standing_work_run.workId AND s.leaseExpiresAt < ?)`
+        )
+        .run(input.now, input.orgId, input.workId, input.now)
+      const eligible = await tx
+        .prepare(
+          `UPDATE standing_work_state SET executionEpoch = executionEpoch + 1, leaseOwner = ?, leaseExpiresAt = ?
+         WHERE orgId = ? AND workId = ? AND nextCheckAt <= ? AND (leaseExpiresAt IS NULL OR leaseExpiresAt < ?)
+           AND NOT EXISTS (SELECT 1 FROM standing_work_run r WHERE r.orgId = standing_work_state.orgId AND r.workId = standing_work_state.workId AND r.status = 'running')`
+        )
+        .run(input.ownerId, input.now + input.leaseMs, input.orgId, input.workId, input.now, input.now)
+      if (Number(eligible.changes) === 0) return undefined
+      const current = (await tx
+        .prepare('SELECT executionEpoch, wakeSource FROM standing_work_state WHERE orgId = ? AND workId = ?')
+        .get(input.orgId, input.workId)) as { executionEpoch: number; wakeSource: 'scheduled' | 'conversation' }
+      const definition = (await tx
+        .prepare(
+          `SELECT state, approvalState, approvalVersion, definitionVersion, expiresAt FROM standing_work WHERE orgId = ? AND workId = ?`
+        )
+        .get(input.orgId, input.workId)) as Pick<
+        StandingWorkRow,
+        'state' | 'approvalState' | 'approvalVersion' | 'definitionVersion' | 'expiresAt'
+      >
+      if (
+        definition.state !== 'active' ||
+        definition.approvalState !== 'approved' ||
+        definition.approvalVersion !== definition.definitionVersion ||
+        definition.definitionVersion !== input.definitionVersion ||
+        definition.expiresAt <= input.now
+      )
+        throw new RollbackSignal()
+      // Lease loss is not success. Re-open the same logical occurrence (and preserve its run id)
+      // for a bounded retry; a new row would conflict with the occurrence uniqueness fence.
+      const prior = (await tx
+        .prepare(
+          'SELECT * FROM standing_work_run WHERE orgId = ? AND workId = ? AND definitionVersion = ? AND occurrenceId = ?'
+        )
+        .get(input.orgId, input.workId, input.definitionVersion, input.occurrenceId)) as StandingWorkRunRow | undefined
+      if (prior) {
+        if (prior.status === 'running') {
+          const abandoned = await tx
+            .prepare(
+              `UPDATE standing_work_run SET status = 'failed', finishedAt = ?, errorCode = 'lease_expired'
+             WHERE orgId = ? AND workId = ? AND runId = ? AND status = 'running'`
+            )
+            .run(input.now, input.orgId, input.workId, prior.runId)
+          if (Number(abandoned.changes) === 0) throw new RollbackSignal()
+        } else if (prior.status !== 'failed') throw new RollbackSignal()
+        const retried = await tx
+          .prepare(
+            `UPDATE standing_work_run SET status = 'running', executionEpoch = ?, attempt = attempt + 1, startedAt = ?, finishedAt = NULL, errorCode = NULL
+           WHERE orgId = ? AND workId = ? AND runId = ? AND status = 'failed' AND attempt < 3`
+          )
+          .run(current.executionEpoch, input.now, input.orgId, input.workId, prior.runId)
+        if (Number(retried.changes) === 0) {
+          // Exhaustion is terminal and observable. Leaving the item due would turn a
+          // malformed or permanently failing objective into an unbounded claim loop.
+          await tx
+            .prepare(
+              `UPDATE standing_work_run SET status = 'blocked', finishedAt = ?, errorCode = 'retry_exhausted'
+             WHERE orgId = ? AND workId = ? AND runId = ? AND status = 'failed'`
+            )
+            .run(input.now, input.orgId, input.workId, prior.runId)
+          await tx
+            .prepare(
+              `UPDATE standing_work_state SET leaseOwner = NULL, leaseExpiresAt = NULL, blockedReason = 'retry_exhausted', nextCheckAt = ?
+             WHERE orgId = ? AND workId = ? AND executionEpoch = ? AND leaseOwner = ?`
+            )
+            .run(Number.MAX_SAFE_INTEGER, input.orgId, input.workId, current.executionEpoch, input.ownerId)
+          return undefined
+        }
+        return (await tx
+          .prepare('SELECT * FROM standing_work_run WHERE orgId = ? AND workId = ? AND runId = ?')
+          .get(input.orgId, input.workId, prior.runId)) as StandingWorkRunRow
+      }
+      await tx
+        .prepare(
+          `INSERT INTO standing_work_run (orgId, workId, runId, definitionVersion, occurrenceId, dueAt, executionEpoch, attempt, status, startedAt, wakeSource)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'running', ?, ?)`
+        )
+        .run(
+          input.orgId,
+          input.workId,
+          input.runId,
+          input.definitionVersion,
+          input.occurrenceId,
+          input.dueAt,
+          current.executionEpoch,
+          input.now,
+          current.wakeSource
+        )
+      return (await tx
+        .prepare('SELECT * FROM standing_work_run WHERE orgId = ? AND workId = ? AND runId = ?')
+        .get(input.orgId, input.workId, input.runId)) as StandingWorkRunRow
+    }).catch((error) => (error instanceof RollbackSignal ? undefined : Promise.reject(error)))
+  }
+
+  async renewStandingWorkLease(
+    orgId: string,
+    workId: string,
+    epoch: number,
+    ownerId: string,
+    now: number,
+    leaseMs: number
+  ): Promise<boolean> {
+    const changed = await this.db
+      .prepare(
+        `UPDATE standing_work_state SET leaseExpiresAt = ? WHERE orgId = ? AND workId = ? AND executionEpoch = ? AND leaseOwner = ? AND leaseExpiresAt >= ?`
+      )
+      .run(now + leaseMs, orgId, workId, epoch, ownerId, now)
+    return Number(changed.changes) === 1
+  }
+
+  /** Commit terminal result and notification intent atomically, fenced by owner, epoch, and definition version. */
+  async reportStandingWork(input: {
+    orgId: string
+    workId: string
+    runId: string
+    ownerId: string
+    epoch: number
+    definitionVersion: number
+    authorizationRevision?: number
+    outcome: Exclude<StandingWorkRunStatus, 'pending' | 'running' | 'failed'>
+    now: number
+    nextCheckAt?: number
+    suggestedNextCheckAt?: number
+    observationState: string
+    contextCursor?: string
+    sessionId?: string
+    errorCode?: string
+    notification?: { effectId: string; destination: string; payload: string; payloadHash: string }
+  }): Promise<{ status: 'committed' | 'duplicate' | 'stale' }> {
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const run = (await tx
+        .prepare('SELECT * FROM standing_work_run WHERE orgId = ? AND workId = ? AND runId = ?')
+        .get(input.orgId, input.workId, input.runId)) as StandingWorkRunRow | undefined
+      if (!run) return { status: 'stale' as const }
+      if (run.status !== 'running') return { status: 'duplicate' as const }
+      if (run.definitionVersion !== input.definitionVersion || run.executionEpoch !== input.epoch)
+        return { status: 'stale' as const }
+      const fence = (await tx
+        .prepare(
+          `SELECT w.state, w.definitionVersion, w.approvalState, w.approvalVersion, w.authorizationRevision, s.executionEpoch, s.leaseOwner, s.leaseExpiresAt FROM standing_work w JOIN standing_work_state s ON s.orgId = w.orgId AND s.workId = w.workId WHERE w.orgId = ? AND w.workId = ?`
+        )
+        .get(input.orgId, input.workId)) as {
+        state: string
+        definitionVersion: number
+        approvalState: string
+        approvalVersion: number | null
+        authorizationRevision: number
+        executionEpoch: number
+        leaseOwner: string | null
+        leaseExpiresAt: number | null
+      }
+      if (
+        fence.state !== 'active' ||
+        fence.definitionVersion !== input.definitionVersion ||
+        fence.approvalState !== 'approved' ||
+        fence.approvalVersion !== fence.definitionVersion ||
+        (input.authorizationRevision !== undefined && fence.authorizationRevision !== input.authorizationRevision) ||
+        fence.executionEpoch !== input.epoch ||
+        fence.leaseOwner !== input.ownerId ||
+        (fence.leaseExpiresAt ?? 0) < input.now
+      )
+        return { status: 'stale' as const }
+      await tx
+        .prepare(
+          `UPDATE standing_work_run SET status = ?, outcome = ?, sessionId = ?, errorCode = ?, finishedAt = ?, suggestedNextCheckAt = ? WHERE orgId = ? AND workId = ? AND runId = ? AND status = 'running'`
+        )
+        .run(
+          input.outcome,
+          input.outcome,
+          input.sessionId ?? null,
+          input.errorCode ?? null,
+          input.now,
+          input.suggestedNextCheckAt ?? null,
+          input.orgId,
+          input.workId,
+          input.runId
+        )
+      await tx
+        .prepare(
+          `UPDATE standing_work_state SET lastRunAt = ?, nextCheckAt = ?, suggestedNextCheckAt = ?, wakeSource = 'scheduled', observationState = ?, contextCursor = COALESCE(?, contextCursor), leaseOwner = NULL, leaseExpiresAt = NULL, blockedReason = ? WHERE orgId = ? AND workId = ?`
+        )
+        .run(
+          input.now,
+          input.outcome === 'complete' ? Number.MAX_SAFE_INTEGER : (input.nextCheckAt ?? input.now),
+          input.suggestedNextCheckAt ?? null,
+          input.observationState,
+          input.contextCursor ?? null,
+          input.outcome === 'blocked' ? (input.errorCode ?? 'blocked') : null,
+          input.orgId,
+          input.workId
+        )
+      if (input.outcome === 'complete')
+        await tx
+          .prepare(`UPDATE standing_work SET state = 'completed' WHERE orgId = ? AND workId = ?`)
+          .run(input.orgId, input.workId)
+      if (input.notification)
+        await tx
+          .prepare(
+            `INSERT INTO standing_work_notification_outbox (orgId, workId, runId, notificationIndex, effectId, definitionVersion, authorizationRevision, destination, payload, payloadHash, status, nextAttemptAt) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'pending', ?) ON CONFLICT (orgId, runId, notificationIndex) DO NOTHING`
+          )
+          .run(
+            input.orgId,
+            input.workId,
+            input.runId,
+            input.notification.effectId,
+            input.definitionVersion,
+            fence.authorizationRevision,
+            input.notification.destination,
+            input.notification.payload,
+            input.notification.payloadHash,
+            input.now
+          )
+      return { status: 'committed' as const }
+    })
+  }
+
+  /** Claim one notification for external delivery.  Sending is deliberately outside the report transaction. */
+  async recoverStaleStandingWorkSends(
+    now: number,
+    eligibleAgentIds?: readonly string[]
+  ): Promise<Array<{ orgId: string; workId: string; runId: string; agentId: string }>> {
+    if (this.shared && !eligibleAgentIds?.length) return []
+    if (eligibleAgentIds && eligibleAgentIds.length === 0) return []
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const agentScope = eligibleAgentIds ? ` AND w.agentId IN (${eligibleAgentIds.map(() => '?').join(',')})` : ''
+      const stale = (await tx
+        .prepare(
+          `SELECT o.orgId, o.workId, o.runId, o.notificationIndex, w.agentId AS "agentId"
+         FROM standing_work_notification_outbox o JOIN standing_work w ON w.orgId = o.orgId AND w.workId = o.workId
+         WHERE o.status = 'sending' AND o.nextAttemptAt <= ?${agentScope}`
+        )
+        .all(now - 60_000, ...(eligibleAgentIds ?? []))) as Array<{
+        orgId: string
+        workId: string
+        runId: string
+        notificationIndex: number
+        agentId: string
+      }>
+      for (const row of stale) {
+        await tx
+          .prepare(
+            `UPDATE standing_work_notification_outbox SET status = 'uncertain', lastError = 'receipt_missing_after_send', nextAttemptAt = NULL
+           WHERE orgId = ? AND runId = ? AND notificationIndex = ? AND status = 'sending'`
+          )
+          .run(row.orgId, row.runId, row.notificationIndex)
+      }
+      return stale.map(({ orgId, workId, runId, agentId }) => ({ orgId, workId, runId, agentId }))
+    })
+  }
+
+  /** Claim one notification for external delivery.  Sending is deliberately outside the report transaction. */
+  async claimStandingWorkNotification(
+    ownerNow: number,
+    eligibleAgentIds?: readonly string[]
+  ): Promise<StandingWorkNotificationRow | undefined> {
+    // A shared pool member must never claim another holder's notification. Empty placement
+    // means no work, not a fleet-wide scan. Local stores retain their exclusive-owner path.
+    if (this.shared && !eligibleAgentIds?.length) return undefined
+    if (eligibleAgentIds && eligibleAgentIds.length === 0) return undefined
+    return this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const agentScope = eligibleAgentIds ? ` AND w.agentId IN (${eligibleAgentIds.map(() => '?').join(',')})` : ''
+      await tx
+        .prepare(
+          `UPDATE standing_work_notification_outbox SET status = 'suppressed', nextAttemptAt = NULL
+         WHERE status IN ('pending','failed') AND EXISTS (
+           SELECT 1 FROM standing_work w WHERE w.orgId = standing_work_notification_outbox.orgId
+             AND w.workId = standing_work_notification_outbox.workId
+             AND (w.definitionVersion <> standing_work_notification_outbox.definitionVersion
+               OR w.authorizationRevision <> standing_work_notification_outbox.authorizationRevision
+               OR w.approvalState <> 'approved' OR w.approvalVersion IS NULL OR w.approvalVersion <> w.definitionVersion
+               OR w.state NOT IN ('active','completed'))
+         )`
+        )
+        .run()
+      const row = (await tx
+        .prepare(
+          `SELECT o.*, w.timezone AS tz, w.maxNotificationsPerDay AS "maxNotif" FROM standing_work_notification_outbox o JOIN standing_work w ON w.orgId = o.orgId AND w.workId = o.workId
+         WHERE o.status IN ('pending','failed') AND (o.nextAttemptAt IS NULL OR o.nextAttemptAt <= ?)
+           AND w.definitionVersion = o.definitionVersion AND w.authorizationRevision = o.authorizationRevision
+           AND w.approvalState = 'approved' AND w.approvalVersion = w.definitionVersion
+           AND w.state IN ('active','completed')
+           ${agentScope}
+         ORDER BY o.nextAttemptAt, o.runId LIMIT 1`
+        )
+        .get(ownerNow, ...(eligibleAgentIds ?? []))) as
+        (StandingWorkNotificationRow & { tz: string; maxNotif: number }) | undefined
+      if (!row) return undefined
+      // Reserve the daily notification allowance atomically before the external send. A delivered,
+      // in-flight, or uncertain notification for that work's run today already owns a slot; a
+      // `failed` one does not, so its capped retry can re-reserve. Exhaustion defers, never drops.
+      const day = policyDayWindow(row.tz, ownerNow)
+      const spent = (await tx
+        .prepare(
+          `SELECT COUNT(*) AS c FROM standing_work_notification_outbox o JOIN standing_work_run r ON r.orgId = o.orgId AND r.workId = o.workId AND r.runId = o.runId
+         WHERE o.orgId = ? AND o.workId = ? AND o.status IN ('delivered','sending','uncertain') AND r.finishedAt >= ? AND r.finishedAt < ?`
+        )
+        .get(row.orgId, row.workId, day.start, day.end)) as { c: number }
+      if (spent.c >= row.maxNotif) {
+        await tx
+          .prepare(
+            `UPDATE standing_work_notification_outbox SET nextAttemptAt = ? WHERE orgId = ? AND runId = ? AND notificationIndex = ? AND status IN ('pending','failed')`
+          )
+          .run(day.end, row.orgId, row.runId, row.notificationIndex)
+        return undefined
+      }
+      const changed = await tx
+        .prepare(
+          `UPDATE standing_work_notification_outbox SET status = 'sending', attempt = attempt + 1, nextAttemptAt = ? WHERE orgId = ? AND runId = ? AND notificationIndex = ? AND status = ?`
+        )
+        .run(ownerNow, row.orgId, row.runId, row.notificationIndex, row.status)
+      if (Number(changed.changes) === 0) throw new RollbackSignal()
+      return { ...row, status: 'sending' as const, attempt: Number(row.attempt) + 1 }
+    }).catch((error) => (error instanceof RollbackSignal ? undefined : Promise.reject(error)))
+  }
+
+  /** A provider without reconciliation must use `uncertain`; this API never blindly resends it. */
+  async settleStandingWorkNotification(input: {
+    orgId: string
+    runId: string
+    notificationIndex: number
+    status: 'delivered' | 'uncertain' | 'failed' | 'suppressed'
+    now: number
+    receipt?: string
+    error?: string
+    retryAt?: number
+  }): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE standing_work_notification_outbox SET status = ?, providerReceipt = ?, lastError = ?, nextAttemptAt = ?
+       WHERE orgId = ? AND runId = ? AND notificationIndex = ? AND status = 'sending'`
+      )
+      .run(
+        input.status,
+        input.receipt ?? null,
+        input.error ?? null,
+        input.status === 'failed' ? (input.retryAt ?? null) : null,
+        input.orgId,
+        input.runId,
+        input.notificationIndex
+      )
+    return Number(result.changes) === 1
+  }
+
+  async suppressStandingWorkNotifications(orgId: string, workId: string): Promise<number> {
+    const result = await this.db
+      .prepare(
+        `UPDATE standing_work_notification_outbox SET status = 'suppressed', nextAttemptAt = NULL WHERE orgId = ? AND workId = ? AND status IN ('pending','failed')`
+      )
+      .run(orgId, workId)
+    return Number(result.changes)
   }
 
   async getSession(key: string): Promise<SessionRecord | undefined> {
@@ -2609,6 +4032,44 @@ export class LocalStore {
         needsParentReply: rec.needsParentReply === 1 ? 1 : null,
         platformStanding: rec.platformStanding ?? null
       })
+    // Per-thread sessions still have one coordinate for both roles. An append
+    // coordinate is logical only, however, and must never become a provider
+    // thread-affinity record; the daemon records its actual physical delivery
+    // thread after admission/turn creation instead.
+    if (!rec.thread.startsWith('append:')) {
+      await this.recordThreadParticipation({
+        channel: rec.channel,
+        thread: rec.thread,
+        agentId: rec.agentId,
+        sessionKey: rec.key,
+        transportScope: rec.transportScope ?? null,
+        updatedAt: rec.updatedAt
+      })
+    }
+  }
+
+  /** Note that an agent is active in a PHYSICAL thread (channel-session-mode.md §6.4). */
+  async recordThreadParticipation(p: {
+    channel: string
+    thread: string
+    agentId: string
+    sessionKey: string
+    transportScope?: string | null
+    updatedAt?: number
+  }): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO thread_participation (channel, thread, agentId, transportScope, sessionKey, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (channel, thread, agentId, transportScope)
+         DO UPDATE SET sessionKey = excluded.sessionKey, updatedAt = excluded.updatedAt`
+      )
+      .run(p.channel, p.thread, p.agentId, p.transportScope ?? '', p.sessionKey, p.updatedAt ?? Date.now())
+    // Hygiene, not correctness — the read fences on the session's own scope, so a row left
+    // here by a crash resolves nothing. This keeps a scope move from accumulating rows.
+    await this.db
+      .prepare('DELETE FROM thread_participation WHERE sessionKey = ? AND transportScope != ?')
+      .run(p.sessionKey, p.transportScope ?? '')
   }
 
   /** Record how the turn that just ended went (§7.3 companion of {@link setSessionState}):
@@ -3262,10 +4723,20 @@ export class LocalStore {
           .run(rec.agentId, outward, purge.reason, purge.at, purge.ownerId ?? null, purge.at)
       }
       await tx.prepare('DELETE FROM sessions WHERE key = ?').run(key)
+      if (rec.thread?.startsWith('append:') && rec.agentId && rec.channel) {
+        await tx
+          .prepare(
+            `DELETE FROM append_session_reservation
+             WHERE agentId = ? AND channel = ? AND transportScope = ? AND coordinate = ?`
+          )
+          .run(rec.agentId, rec.channel, rec.transportScope ?? '', rec.thread)
+      }
       // Its identity goes with it: the receipt just reported this id as purged, so the next
       // session on the same slot must be a new one, not this one's name reused.
       await tx.prepare('DELETE FROM session_outward_ids WHERE key = ?').run(key)
       await tx.prepare('DELETE FROM session_mutes WHERE key = ?').run(key)
+      // The affinity record outlives nothing: its whole meaning is the session it names.
+      await tx.prepare('DELETE FROM thread_participation WHERE sessionKey = ?').run(key)
       await tx.prepare('DELETE FROM inbox WHERE sessionKey = ? AND terminalReport IS NULL').run(key)
       if (rec.acpSessionId) {
         // Once the local session content is gone, creating a new CP metadata row
@@ -4727,6 +6198,41 @@ export class LocalStore {
       .all(orgId, channel, thread, sinceTs, agentId, agentId, agentId)) as unknown as TranscriptEntry[]
   }
 
+  /** Bounded conversation context for Standing Work, scoped to messages the agent actually received or sent. */
+  async standingWorkContextPage(
+    orgId: string,
+    agentId: string,
+    channel: string,
+    thread: string | undefined,
+    afterSeq: number,
+    limit = 32
+  ): Promise<{ rows: StandingWorkContextRow[]; hasMore: boolean }> {
+    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 64) {
+      throw new Error('invalid standing work context cursor or limit')
+    }
+    const rows = (
+      thread
+        ? await this.db
+            .prepare(
+              `SELECT seq, thread, ts, sender, text FROM transcript
+           WHERE orgId = ? AND channel = ? AND thread = ? AND seq > ? AND kind = 'text'
+             AND ${AGENT_DELIVERY_SCOPE_SQL}
+           ORDER BY seq ASC LIMIT ?`
+            )
+            .all(orgId, channel, thread, afterSeq, agentId, agentId, agentId, limit + 1)
+        : await this.db
+            .prepare(
+              `SELECT seq, thread, ts, sender, text FROM transcript
+           WHERE orgId = ? AND channel = ? AND seq > ? AND kind = 'text'
+             AND ${AGENT_DELIVERY_SCOPE_SQL}
+           ORDER BY seq ASC LIMIT ?`
+            )
+            .all(orgId, channel, afterSeq, agentId, agentId, agentId, limit + 1)
+    ) as StandingWorkContextRow[]
+    const hasMore = rows.length > limit
+    return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore }
+  }
+
   /**
    * Provider-neutral context fence for one physical conversation thread. Unlike
    * `transcriptSince`, this never compares provider message ids from different
@@ -4874,10 +6380,62 @@ export class LocalStore {
   }
 
   async openSessionAgents(channel: string, thread: string, transportScope?: string | null): Promise<string[]> {
+    return await this.threadAgentsByState(channel, thread, transportScope, 'open')
+  }
+
+  /** Live logical sessions that have participated in one PHYSICAL thread. This is
+   * the bridge for an unrouted observation: append sessions are keyed by a
+   * synthetic coordinate, so their transcript must not fall back to this physical
+   * thread just because routing did not select a recipient. */
+  async activeThreadParticipations(
+    channel: string,
+    thread: string,
+    transportScope?: string | null
+  ): Promise<Array<{ agentId: string; sessionThread: string }>> {
+    return (await this.db
+      .prepare(
+        `SELECT DISTINCT p.agentId AS agentId, s.thread AS sessionThread
+         FROM thread_participation p
+         JOIN sessions s ON s.key = p.sessionKey
+           AND COALESCE(s.transportScope, '') = p.transportScope
+           AND s.agentId = p.agentId
+         WHERE p.channel = ? AND p.thread = ? AND p.transportScope = ? AND s.state != 'closed'`
+      )
+      .all(channel, thread, transportScope ?? '')) as Array<{ agentId: string; sessionThread: string }>
+  }
+
+  /**
+   * Agents participating in a PHYSICAL thread, split by whether their session is live.
+   *
+   * Reads `thread_participation` rather than `sessions` (channel-session-mode.md §6.4):
+   * the two agree while a session IS a thread, but an `append` session lives at a
+   * coordinate that is no thread's, so the session row stops being able to answer "who is
+   * talking in this thread". Liveness still comes from the session the row points at, so
+   * open-vs-dormant is decided in exactly one place, as before.
+   *
+   * The join fences on the SESSION's own scope and agent, not just the key: a record is
+   * only as good as its agreement with the session it names. The old lookup could not
+   * disagree with itself — it read one row — whereas these are two rows written by two
+   * statements, so a record left behind by a scope move (or a crash between them) must
+   * fail closed rather than keep resolving through a scope the session has left. The join
+   * also drops a record whose session is gone, which is what made "no session row ⇒ not
+   * listed" true before this table existed.
+   */
+  private async threadAgentsByState(
+    channel: string,
+    thread: string,
+    transportScope: string | null | undefined,
+    want: 'open' | 'closed'
+  ): Promise<string[]> {
+    const predicate = want === 'open' ? "s.state != 'closed'" : "s.state = 'closed'"
     return (
       (await this.db
         .prepare(
-          "SELECT agentId FROM sessions WHERE channel = ? AND thread = ? AND COALESCE(transportScope, '') = ? AND state != 'closed'"
+          `SELECT DISTINCT p.agentId AS agentId FROM thread_participation p
+           JOIN sessions s ON s.key = p.sessionKey
+             AND COALESCE(s.transportScope, '') = p.transportScope
+             AND s.agentId = p.agentId
+           WHERE p.channel = ? AND p.thread = ? AND p.transportScope = ? AND ${predicate}`
         )
         .all(channel, thread, transportScope ?? '')) as { agentId: string }[]
     ).map((r) => r.agentId)
@@ -4889,13 +6447,7 @@ export class LocalStore {
    *  resumes the ACP session. Kept separate from `openSessionAgents` so the live
    *  multi-agent disambiguation (2+ open owners → mention-gated) is never perturbed. */
   async closedSessionAgents(channel: string, thread: string, transportScope?: string | null): Promise<string[]> {
-    return (
-      (await this.db
-        .prepare(
-          "SELECT agentId FROM sessions WHERE channel = ? AND thread = ? AND COALESCE(transportScope, '') = ? AND state = 'closed'"
-        )
-        .all(channel, thread, transportScope ?? '')) as { agentId: string }[]
-    ).map((r) => r.agentId)
+    return await this.threadAgentsByState(channel, thread, transportScope, 'closed')
   }
 
   /** Count non-closed sessions in (channel, thread) touched at/after `sinceTs`
@@ -5230,16 +6782,18 @@ export class LocalStore {
     const inserted = await this.db
       .prepare(
         `INSERT OR IGNORE INTO inbox
-          (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, posterPublishState,
+          (id, sessionKey, agentId, deliveryThread, sessionThread, msg, integrationId, callMeta, hookContext, posterPublishState,
             terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
          VALUES
-           (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
+           (@id, @sessionKey, @agentId, @deliveryThread, @sessionThread, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
             @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
       )
       .run({
         id: row.id,
         sessionKey: row.sessionKey,
         agentId: row.agentId,
+        deliveryThread: row.deliveryThread ?? null,
+        sessionThread: row.sessionThread ?? null,
         msg: row.msg,
         integrationId: row.integrationId ?? null,
         callMeta: row.callMeta ?? null,
@@ -5282,16 +6836,18 @@ export class LocalStore {
         tx
           .prepare(
             `INSERT OR IGNORE INTO inbox
-              (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, posterPublishState,
+              (id, sessionKey, agentId, deliveryThread, sessionThread, msg, integrationId, callMeta, hookContext, posterPublishState,
                 terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
              VALUES
-               (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
+               (@id, @sessionKey, @agentId, @deliveryThread, @sessionThread, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
                 @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
           )
           .run({
             id: r.id,
             sessionKey: r.sessionKey,
             agentId: r.agentId,
+            deliveryThread: r.deliveryThread ?? null,
+            sessionThread: r.sessionThread ?? null,
             msg: r.msg,
             integrationId: r.integrationId ?? null,
             callMeta: r.callMeta ?? null,

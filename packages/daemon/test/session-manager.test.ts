@@ -69,6 +69,20 @@ const msg = (over: Partial<NormalizedMessage> & { ts?: string; channel?: string 
 }
 
 describe('SessionManager', () => {
+  it('stores a logical session and transcript under the carried coordinate', async () => {
+    const store = await newStore()
+    const host = fakeHost()
+    const sm = new SessionManager({ store, hostFor: async () => host, agentById: () => agent, memory })
+    const inbound = msg({ ts: '100.8', thread: 'physical-thread', text: 'logical delivery' })
+    const coordinates = { deliveryThread: 'physical-thread', sessionThread: 'logical-session' }
+    await sm.handle('bot-a', inbound, undefined, undefined, undefined, undefined, undefined, { coordinates })
+    expect(await store.getSession(sessionKey('slack', 'C1', 'logical-session', 'bot-a'))).toBeDefined()
+    expect(await store.getSession(sessionKey('slack', 'C1', 'physical-thread', 'bot-a'))).toBeUndefined()
+    expect((await store.threadTranscript('C1', 'logical-session')).some((row) => row.text === 'logical delivery')).toBe(
+      true
+    )
+    await store.close()
+  })
   it('creates a session on the first message and prompts with just that text', async () => {
     const store = await newStore()
     const host = fakeHost()

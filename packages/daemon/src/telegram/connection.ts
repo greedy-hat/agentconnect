@@ -32,7 +32,7 @@ const TELEGRAM_CAPTION_LIMIT = 1024
  *
  * Control surface: unlike Slack (interactive status bar + modal), Telegram exposes
  * session state and controls via slash commands — `/status`, `/stop`, `/cancel`, `/resume`,
- * `/fast`, `/queue`, parsed by the daemon like any inbound text. start() registers
+ * `/new`, `/fast`, `/queue`, parsed by the daemon like any inbound text. start() registers
  * them with BotFather (setMyCommands) so they autocomplete in the Telegram UI.
  */
 
@@ -44,6 +44,7 @@ const BOT_COMMANDS: { command: string; description: string }[] = [
   { command: 'stop', description: 'Stop the current turn and mute until you @mention me' },
   { command: 'cancel', description: 'Cancel the current turn (keep the session live)' },
   { command: 'resume', description: 'Reset loop protection and unmute this conversation' },
+  { command: 'new', description: 'Start a fresh conversation context' },
   { command: 'fast', description: 'Toggle fast mode — /fast on | off' },
   { command: 'models', description: 'Choose the model — /models [name] (bare = list)' },
   { command: 'effort', description: 'Choose reasoning effort — /effort [level] (bare = list)' },

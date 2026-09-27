@@ -45,7 +45,7 @@ import { MOBILE_NAV, MORE_ROWS, NAV_GROUPS, SECTIONS, navVisible } from './nav'
 // Top-level routes own the tab-bar + list app bar (no back button, bottom nav shown);
 // every other route is a "push" screen (back-button app bar, no bottom nav) on mobile.
 // Home is a top-level surface (the default landing), not a push screen.
-const LIST_ROUTES = ['/home', '/agents', '/sessions', '/crons', '/daemons']
+const LIST_ROUTES = ['/home', '/agents', '/sessions', '/crons', '/standing-work', '/daemons']
 const CONSOLE_SWR_CONFIG = {
   dedupingInterval: 2_000,
   focusThrottleInterval: 5_000,

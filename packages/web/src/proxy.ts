@@ -16,6 +16,7 @@ const CONSOLE_ROOTS = [
   'sessions',
   'daemons',
   'crons',
+  'standing-work',
   'tools',
   'usage',
   'billing',

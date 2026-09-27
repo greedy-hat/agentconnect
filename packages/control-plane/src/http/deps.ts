@@ -67,6 +67,12 @@ import type {
   WebchatMcpOperationRepo
 } from '../persistence/ports.js'
 import type { Clock } from '../domain/clock.js'
+import type {
+  StandingWorkConversationRef,
+  StandingWorkDestination,
+  StandingWorkRepo
+} from '../standing-work/contracts.js'
+import type { FastifyRequest } from 'fastify'
 import type { OAuthService } from '../registry/oauthService.js'
 import type { GithubService } from '../github/service.js'
 import type { CodeHostTrustedActorService } from '../codehost/trusted-actor.service.js'
@@ -93,6 +99,7 @@ import type { DaemonReleaseResolver } from '../registry/daemonRelease.js'
 import type { WebchatTokenService } from '../registry/webchatToken.js'
 import type { OrgInviteLinkService } from '../registry/orgInviteLinkService.js'
 import type { WaitlistService } from '../registry/waitlistService.js'
+import type { PrincipalService } from '../registry/principalService.js'
 import type { ControlSender } from '../orchestrator/outbound.js'
 import type { AgentDelivery } from '../orchestrator/agentDelivery.js'
 import type { PlacementResolver } from '../orchestrator/placementResolver.js'
@@ -165,6 +172,15 @@ export interface HttpServerConfig extends HumanAuthConfig {
 }
 
 export interface HttpDeps {
+  /** Provider-backed current grant check; absent keeps Standing Work admission closed. */
+  standingWorkGrant?: (input: {
+    request: FastifyRequest
+    orgId: string
+    actorId: string
+    agentId: string
+    destination: StandingWorkDestination
+    context: StandingWorkConversationRef | null
+  }) => Promise<boolean>
   /** Secret-free startup snapshot served to the prebuilt browser image. */
   runtimeConfig: RuntimeConfigRouteDeps
   /** Deployment quota for non-ADMIN organization creation; absent defaults to one. */
@@ -178,6 +194,7 @@ export interface HttpDeps {
      *  upgrade/restart routes open a pending op; the fleet DTO overlays it. */
     daemonLifecycleOp: DaemonLifecycleOpRepo
     cron: CronRepo
+    standingWork?: StandingWorkRepo
     /** Inbound-webhook trigger definitions + run metadata (never payloads). */
     hook: HookRepo
     /** Per-hook HMAC key — written on create, echoed exactly once, never DTO'd. */
@@ -397,6 +414,8 @@ export interface HttpDeps {
   inviteLinks: OrgInviteLinkService
   /** Closed-beta admission: `/me/access` status, self-join, join-link redeem (waitlist-and-login.md). */
   waitlist: WaitlistService
+  /** Org-owned execution identity + grant lifecycle (I1 Agent Identity v1). */
+  principals: PrincipalService
   /** The shared usage report interface — this plane is its `gateway`-source adapter. */
   usageWriter: UsageWriter
   /** Reviews a projected ServiceAccount token for an in-cluster workload. Absent ⇒ this

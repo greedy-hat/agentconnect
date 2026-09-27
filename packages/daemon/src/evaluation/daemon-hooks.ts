@@ -13,6 +13,7 @@ import type { LoadedAgent } from '../agents/load-agents.js'
 import { ALL_TOOL_NAMES } from '../mcp/tools.js'
 import { stableTurnId, type NormalizedMessage } from '../messages/normalized.js'
 import { sessionKey } from '../store/local-store.js'
+import type { SessionCoordinates } from '../session/session-coordinate.js'
 import type { CallMeta } from '../daemon/turn-types.js'
 import type { WebchatSink, WebchatTurnContext } from '../webchat/types.js'
 import type {
@@ -40,12 +41,13 @@ import type { VirtualPlatform, VirtualPlatformConnection } from './virtual-conne
 
 /** Extra dispatch options the evaluation seam needs; a subset of the daemon's own. */
 export interface EvaluationDispatchOptions {
+  coordinates?: SessionCoordinates
   /** A rendezvous-backed activation must not go terminal without a durable row. */
   requireDurable?: boolean
   /** Stable target-scoped inbox id for one physical event delivered to several local agents. */
   deliveryId?: string
   /** Synchronous admission barrier, settled before any turn can start. */
-  onAdmission?: (result: { accepted: boolean; reason?: string; duplicate?: boolean }) => void
+  onAdmission?: (result: { accepted: boolean; reason?: string; duplicate?: boolean; sessionKey?: string }) => void
 }
 
 /** Exactly what the evaluation hooks touch on the Daemon — nothing wider. */
@@ -212,7 +214,9 @@ export class DaemonEvaluationHooks {
       ...dispatchOpts,
       onAdmission: (result) => {
         if (result.accepted && !result.duplicate) {
-          const key = sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
+          const key =
+            result.sessionKey ??
+            sessionKey(msg.platform, msg.channel, msg.thread ?? msg.msgId, agentId, msg.transportScope)
           settleAdmission({ admitted: true, agentId, sessionKey: key, turnId })
         } else {
           settleAdmission({ admitted: false, reason: deliveryRejectionReason(result) })

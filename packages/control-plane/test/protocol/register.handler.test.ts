@@ -15,12 +15,14 @@ import {
   GITLAB_COM_V1_FEATURE,
   GITLAB_DEFAULT_BASE_URL,
   GITLAB_INSTANCE_V1_FEATURE,
+  STANDING_WORK_FIXED_V1_FEATURE,
   WORKSPACE_GIT_V1_FEATURE,
   isFrame
 } from '@agentconnect.md/protocol'
 import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { buildWsHarness } from '../fakes/build-ws.js'
+import { PgStandingWorkRepo } from '../../src/persistence/repositories/standing-work.repo.js'
 import type { GithubService } from '../../src/github/service.js'
 
 const DAEMON = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
@@ -798,6 +800,61 @@ describe('register handler — authoritative reconcile snapshot + idempotency + 
     })
     const after = await prisma.daemon.findUnique({ where: { id: DAEMON } })
     expect(after?.name).toBe('host-1')
+  })
+
+  it('W6 gate: a fixed Standing Work definition is projected only to a daemon advertising standing-work-fixed-v1', async () => {
+    await seedReconcileState()
+    const def = await new PgStandingWorkRepo(prisma).create({
+      orgId: DEFAULT_ORG_ID,
+      agentId: AGENT,
+      principalId: `standing-work:${DEFAULT_ORG_ID}`,
+      name: 'watch rollout',
+      objective: 'observe the deploy and warn on failure',
+      schedule: '*/5 * * * *',
+      timezone: 'UTC',
+      startAt: new Date(),
+      expiresAt: new Date(Date.now() + 86_400_000),
+      minIntervalSeconds: 60,
+      maxRunsPerDay: 12,
+      maxNotificationsPerDay: 2,
+      conversationRef: null,
+      targetDestination: { platform: 'slack', integrationId: WORKSPACE, channel: 'C123' },
+      budgetPolicyRef: 'default',
+      toolPolicyRef: 'read-only',
+      notificationPolicy: { mode: 'changes', includeCompletion: true },
+      visibilityPolicyRef: 'org',
+      sourceSessionId: null,
+      scheduleMode: 'fixed' as const,
+      maxIntervalSeconds: 86400,
+      wakeOnConversation: false,
+      actorId: 'actor-1',
+      authorizationRevision: 1,
+      idempotencyKey: 'sw-test-1',
+      requestHash: 'hash-1'
+    })
+    if (def === 'conflict') throw new Error('unexpected idempotency conflict')
+    const workId = def.record.id
+    expect(await new PgStandingWorkRepo(prisma).listForAgents([AGENT])).toHaveLength(1)
+
+    // Register once against a fresh connection advertising exactly these features.
+    const snapshotFor = async (features: string[]) => {
+      const h = buildWsHarness(prisma)
+      const { stub } = await authThenAwaitOk(h)
+      const payload = registerPayload()
+      ;(payload.capabilities as { features?: string[] }).features = features
+      stub.inject('register', payload, { id: REG_ID })
+      const ok = await stub.expectFrame('register/ok')
+      if (!isFrame('register/ok')(ok)) throw new Error('expected register/ok')
+      return ok.payload
+    }
+
+    // Without the capability the definition is withheld entirely (fail-closed on mixed/unknown peers).
+    expect((await snapshotFor([])).standingWorks).toEqual([])
+
+    // Advertising standing-work-fixed-v1 lets the CP project the definition for the served agent.
+    const advertised = await snapshotFor([STANDING_WORK_FIXED_V1_FEATURE])
+    expect(advertised.standingWorks.map((w) => w.workId)).toEqual([workId])
+    expect(advertised.standingWorks[0]).toMatchObject({ agentId: AGENT, name: 'watch rollout', definitionVersion: 1 })
   })
 
   it('a non-auth/register frame before READY → error{code:PROTOCOL_STATE}', async () => {

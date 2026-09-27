@@ -128,7 +128,8 @@ import {
   SessionVisibilityOk,
   SessionPullRequestFeedback,
   SessionPullRequestFeedbackResult,
-  CodeHostNoteDesired
+  CodeHostNoteDesired,
+  StandingWorkControl
 } from '@agentconnect.md/protocol'
 /**
  * `ControlSender` (design §4.7, the single fencing site) — the ONLY place that
@@ -142,6 +143,7 @@ import {
  */
 import { createHash } from 'node:crypto'
 import { daemonSupportsAgent, encodeSpecWorkspaceForPeer } from '../domain/daemon-features.js'
+import { daemonSupportsIntegrationSpec } from '../domain/integration-features.js'
 import {
   MAX_ORGANIZATION_SUGGESTION_BODY_BYTES,
   ORGANIZATION_SUGGESTION_CHUNK_BYTES,
@@ -373,6 +375,9 @@ export class ControlSender {
       if (!daemonSupportsAgent(a.spec, c.capabilities?.features)) {
         throw new Error(`daemon ${daemonId} lacks a feature required by agent ${a.agentId}'s spec`)
       }
+      if (a.integrations.some((integration) => !daemonSupportsIntegrationSpec(integration, c.capabilities?.features))) {
+        throw new Error(`daemon ${daemonId} lacks a feature required by an integration of agent ${a.agentId}`)
+      }
       try {
         return await c.conn.request<Ack>(
           'agent/activate',
@@ -437,6 +442,7 @@ export class ControlSender {
    */
   async integrationUpsert(daemonId: string, u: IntegrationUpsert): Promise<void> {
     const c = this.must(daemonId)
+    if (!daemonSupportsIntegrationSpec(u, c.capabilities?.features)) return
     c.conn.send('integration/upsert', u, { epoch: c.sessionEpoch, agentId: u.agentId })
   }
 
@@ -538,6 +544,14 @@ export class ControlSender {
   async cronRun(daemonId: string, r: CronRunNow): Promise<Ack> {
     const c = this.must(daemonId)
     return c.conn.request<Ack>('cron/run', r, { epoch: c.sessionEpoch })
+  }
+
+  /** Push a lifecycle decision (approve/pause/resume/cancel) to a running daemon.
+   *  Explicit orgId for the same reason as `cronRemove`: a duty holder that did not
+   *  register the standing work cannot resolve the org from its own maps. */
+  async standingWorkControl(daemonId: string, p: StandingWorkControl, orgId?: string): Promise<Ack> {
+    const c = this.must(daemonId)
+    return c.conn.request<Ack>('standing-work/control', p, { epoch: c.sessionEpoch }, undefined, orgId)
   }
 
   /**

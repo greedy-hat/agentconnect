@@ -15,6 +15,7 @@ import { AgentMemoryTransactionService } from './agent-memory/transaction.servic
  */
 import type { FastifyInstance, FastifyServerOptions } from 'fastify'
 import type { PrismaClient } from './generated/prisma/client.js'
+import { PgStandingWorkRepo } from './persistence/repositories/standing-work.repo.js'
 import type { WebSocketServer } from 'ws'
 import {
   DUTY_GRANT_MEMBERS_MAX,
@@ -150,6 +151,7 @@ import {
   PgHookSecretStore,
   PgRuntimeProfileRepo,
   PgAuditRepo,
+  PgPrincipalRepo,
   PgUserRepo,
   PgOrgRepo,
   PgOrgInviteLinkRepo,
@@ -164,6 +166,7 @@ import { AgentSpecAssembler } from './orchestrator/agentSpecAssembler.js'
 import { Placement } from './orchestrator/placement.js'
 import { Watchdog } from './orchestrator/watchdog.js'
 import { CronRunReaper } from './orchestrator/cronRunReaper.js'
+import { StandingWorkExpiryReaper } from './orchestrator/standingWorkExpiryReaper.js'
 import {
   PoolMemberReaper,
   POOL_MEMBER_REAP_AFTER_MS,
@@ -193,7 +196,8 @@ import { WebchatMcpGrantTokenCodec } from './registry/webchatMcpGrantToken.js'
 import { OrgInviteLinkCodec } from './registry/orgInviteLink.js'
 import { OrgInviteLinkService } from './registry/orgInviteLinkService.js'
 import { WaitlistService } from './registry/waitlistService.js'
-import { AgentId, DaemonId, HookId, OrgId } from './domain/ids.js'
+import { PrincipalService } from './registry/principalService.js'
+import { AgentId, BotId, DaemonId, HookId, IntegrationId, OrgId } from './domain/ids.js'
 import { HookService } from './hooks/hook.service.js'
 import { RelayAuthService } from './registry/relayAuthService.js'
 import { DaemonRegistryService } from './registry/registryService.js'
@@ -478,6 +482,7 @@ export function buildContainer(
     linearInstallState: new PgLinearInstallStateStore(prisma),
     presetAgent: new PgPresetAgentStore(prisma),
     cron: new PgCronRepo(prisma),
+    standingWork: new PgStandingWorkRepo(prisma),
     dutyGroup: new PgDutyGroupRepo(prisma),
     memberSet: new PgMemberSetRepo(prisma),
     // Fenced hook writes ask "may this daemon act for the hook's agent" — placement ∪ live duty
@@ -490,6 +495,7 @@ export function buildContainer(
     hookSecret: new PgHookSecretStore(prisma, secretCipher),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
+    principal: new PgPrincipalRepo(prisma),
     // Signup mints no org, so no repo here carries the preset-agent seam flag except
     // the one org-creating repo below (preset-agents.md §3.2).
     user: new PgUserRepo(prisma),
@@ -566,6 +572,7 @@ export function buildContainer(
   // API_KEY_PEPPER (its own domain-separated HMAC) — the external admin app injects
   // the SAME pepper to mint links the CP can verify (§6).
   const waitlist = new WaitlistService(config.API_KEY_PEPPER, repos.waitlist, clock)
+  const principals = new PrincipalService(repos.principal, repos.audit, clock)
 
   // Relay↔CP `rc/auth` dual-mode verifier (§8): shared RELAY_TOKEN and/or per-relay
   // ApiKey. RELAY_TOKEN unset ⇒ token mode is off; org-less relay keys reuse the
@@ -1024,6 +1031,7 @@ export function buildContainer(
       },
       // The duty half of the reconcile roster: pinned-to-me ∪ held-by-me.
       duties: repos.dutyGroup,
+      standingWork: repos.standingWork,
       placement: placementResolver,
       log: { warn: (o, m) => http.log.warn(o, m) } // lazy over http.log (assigned below; called at reconcile time)
     }
@@ -1664,6 +1672,41 @@ export function buildContainer(
         : {},
     maxOrgsPerNonAdminUser: opts.deploymentConfig?.values.features.maxOrgsPerNonAdminUser ?? 1,
     clock,
+    standingWorkGrant: async ({ request, orgId, actorId, agentId, destination, context }) => {
+      // Fixed v1 admits only destinations whose current Slack audience check can answer.
+      if (!slackSessionAccess.available || destination.platform !== 'slack') return false
+      const viewer = { request, orgId: OrgId(orgId), userId: actorId, identitySet: new Set<string>() }
+      await slackSessionAccess.addViewerIdentities(viewer)
+      if (viewer.identitySet.size === 0) return false
+      const check = async (ref: typeof destination): Promise<boolean> => {
+        if (ref.platform !== 'slack') return false
+        const integration = await repos.integration.get(OrgId(orgId), IntegrationId(ref.integrationId))
+        if (!integration || integration.agentId !== agentId || integration.status !== 'active') return false
+        const bot = await repos.bot.get(OrgId(orgId), BotId(integration.botId))
+        const realmKey = bot?.workspaceId ?? bot?.teamId
+        if (!bot || bot.revokedAt || !realmKey) return false
+        const scopeId = `standing-work:${bot.id}:${ref.channel}`
+        const result = await slackSessionAccess.resolve(
+          [
+            {
+              id: scopeId,
+              orgId: OrgId(orgId),
+              provider: 'slack',
+              realmKey,
+              resourceKind: 'conversation',
+              resourceKey: ref.channel,
+              credentialKind: 'bot',
+              credentialId: bot.id,
+              aclRevision: BigInt(bot.credentialRevision),
+              revokedAt: null
+            }
+          ],
+          viewer
+        )
+        return !result.degraded && result.allowedScopes.some((scope) => scope.id === scopeId)
+      }
+      return (await check(destination)) && (!context || (await check(context)))
+    },
     // The same late-bound façade the orchestrators above hold (see its
     // definition): the providers below are constructed WITH `httpDeps` — their
     // funnel plugins are route factories pre-bound to this very bundle — so the
@@ -1759,6 +1802,7 @@ export function buildContainer(
     webchatTokens,
     inviteLinks,
     waitlist,
+    principals,
     usageWriter,
     ...(clusterWorkloadIdentity ? { clusterWorkloadIdentity } : {}),
     events,
@@ -1870,6 +1914,15 @@ export function buildContainer(
       intervalMs: config.CRON_RUN_REAP_INTERVAL_SEC * 1000,
       label: 'hook-run-reaper'
     },
+    http.log
+  )
+
+  // CP-side projection of the daemon's own `expireStandingWork`: transitions defs
+  // past their `expiresAt` to `expired` so the console does not show `active` indefinitely.
+  const standingWorkExpiryReaper = new StandingWorkExpiryReaper(
+    repos.standingWork,
+    clock,
+    { intervalMs: config.STANDING_WORK_EXPIRY_REAP_INTERVAL_SEC * 1000 },
     http.log
   )
 
@@ -2225,6 +2278,8 @@ export function buildContainer(
     memberSets: repos.memberSet,
     agentBundle: (agent) => stagedAgentMoves.bundleFor(agent),
     cron: repos.cron,
+    standingWork: repos.standingWork,
+    audit: repos.audit,
     hook: repos.hook,
     agent: repos.agent,
     organizationKnowledge: repos.organizationKnowledge,
@@ -2617,6 +2672,7 @@ export function buildContainer(
     startBackground() {
       cronRunReaper.start()
       hookRunReaper.start()
+      standingWorkExpiryReaper.start()
       poolMemberReaper?.start()
       webchatMcpOperationReaper.start()
       agentMemoryStagingSweeper.start()
@@ -2642,6 +2698,7 @@ export function buildContainer(
     async shutdown() {
       cronRunReaper.stop()
       hookRunReaper.stop()
+      standingWorkExpiryReaper.stop()
       poolMemberReaper?.stop()
       const webchatMcpOperationSettled = webchatMcpOperationReaper.stopAndSettle()
       agentMemoryStagingSweeper.stop()

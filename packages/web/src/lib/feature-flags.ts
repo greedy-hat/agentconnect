@@ -38,6 +38,18 @@ export type FeatureFlagId =
    *  workspace ALREADY on a git URL still renders its tile — hiding live state is not hiding an
    *  entry point. */
   | 'git-url'
+  /** The Standing Work pages: their nav entries and routes. A standing switch for now —
+   *  the console can inspect and stop durable work, but executing it stays gated on the
+   *  daemon, so a deployment that has not enabled that has nothing to show here. */
+  | 'standing-work'
+  /** The Principals management page: org-owned execution identities and their grants
+   *  (I1 Agent Identity v1). A standing switch — the CP always serves the API; the console
+   *  only offers the UI where the deployment has enabled it. */
+  | 'principals'
+  /** The Audit page: search and export the org's execution trail (A1 Unified Audit). A standing
+   *  switch — the CP serves the owner-only API either way, and the route a deployment turns this
+   *  off has chosen not to surface provenance reads in the console. */
+  | 'audit'
 
 function enabledIds(): ReadonlySet<string> {
   // The server must read the SAME value `PublicEnvScript` injects, in the same precedence, or a

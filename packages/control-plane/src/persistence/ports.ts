@@ -144,6 +144,19 @@ export type AuditKind =
   | 'api_key_rotate'
   | 'api_key_revoke'
   | 'mcp_tool_call'
+  | 'principal_create'
+  | 'principal_disable'
+  | 'principal_enable'
+  | 'principal_grant_create'
+  | 'principal_grant_revoke'
+  // Daemon execution trail (A1 Phase 5), ingested from a daemon's durable outbox.
+  | 'admission'
+  | 'admission_denied'
+  | 'tool_intent'
+  | 'tool_result'
+  | 'budget_reserved'
+  | 'budget_settled'
+  | 'external_effect'
 
 // ───────────────────────────────────────────────────────────────────────────
 // DaemonRepo (C4) — fleet registry & fencing root (§3.3)
@@ -5292,21 +5305,74 @@ export interface AuditInput {
   frameCorr?: string
   message?: string
   details?: Record<string, unknown>
+  // A1 causal envelope. All optional: CP-native control-plane events (api-key,
+  // principal, hook, cron …) carry none, while a daemon-ingested execution
+  // trail carries them. `eventId` is the idempotent ingestion key the daemon
+  // supplies so a retried outbox flush deduplicates.
+  eventId?: string
+  traceId?: string
+  parentEventId?: string
+  effectId?: string
+  principalId?: string
+  source?: 'cp' | 'daemon'
+  occurredAt?: Date
 }
 
 export interface AuditRecord {
   id: bigint
   kind: AuditKind
+  orgId: OrgId | null
   daemonId: DaemonId | null
   agentId: AgentId | null
+  sessionId: SessionId | null
+  actorUserId: string | null
   message: string | null
   details: unknown
+  // A1 causal envelope, surfaced for search / export / timeline assembly.
+  eventId: string | null
+  traceId: string | null
+  parentEventId: string | null
+  effectId: string | null
+  principalId: string | null
+  source: 'cp' | 'daemon'
+  occurredAt: Date | null
   createdAt: Date
+}
+
+/**
+ * A1 audit search filter. `orgId` is required — every audit read is
+ * organization-isolated, there is no global tail. Results are newest-first by
+ * ingestion id (a stable, monotonic cursor). Optional filters narrow by kind,
+ * the causal identifiers, and an ingestion-time window.
+ */
+export interface AuditSearchFilter {
+  orgId: OrgId
+  kinds?: AuditKind[]
+  principalId?: string
+  traceId?: string
+  effectId?: string
+  agentId?: AgentId
+  daemonId?: DaemonId
+  sessionId?: SessionId
+  from?: Date
+  to?: Date
+  /** Last `id` from a prior page; returns rows strictly older than it. */
+  cursor?: bigint
+  limit?: number
+}
+
+export interface AuditSearchPage {
+  events: AuditRecord[]
+  /** Pass as `cursor` on the next call; null when the tail is reached. */
+  nextCursor: bigint | null
 }
 
 export interface AuditRepo {
   append(input: AuditInput): Promise<AuditRecord>
-  recent(limit: number): Promise<AuditRecord[]>
+  /** Insert unless its `eventId` is already recorded — the dedup a daemon's retried outbox flush
+   *  depends on. False means the fact is already here, which the caller treats as success. */
+  appendOnce(input: AuditInput): Promise<boolean>
+  search(filter: AuditSearchFilter): Promise<AuditSearchPage>
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -7120,6 +7186,83 @@ export interface DutyGroupRepo {
   /** Every agent covered by the unexpired leases `holder` holds — the duty half
    *  of the `register/ok` reconcile roster, which is `pinned-to-me ∪ held-by-me`. */
   heldAgentIds(holder: DaemonId, now: Date): Promise<AgentId[]>
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// PrincipalRepo (I1) — org-owned execution principals (improvement-roadmap §5)
+// ───────────────────────────────────────────────────────────────────────────
+
+export type PrincipalKind = 'agent' | 'service' | 'delegated'
+export type PrincipalState = 'active' | 'disabled'
+export type PrincipalGrantResourceType = 'repo' | 'destination' | 'tool'
+export type PrincipalGrantCapability = 'read' | 'comment' | 'write' | 'execute' | 'notify'
+
+export interface PrincipalRecord {
+  id: string
+  orgId: OrgId
+  name: string
+  kind: PrincipalKind
+  agentId: AgentId | null
+  state: PrincipalState
+  disabledAt: Date | null
+  disabledBy: string | null
+  authorizationRevision: number
+  createdByActorId: string
+  createdAt: Date
+  updatedAt: Date
+}
+
+export interface PrincipalGrantRecord {
+  id: string
+  orgId: OrgId
+  principalId: string
+  resourceType: PrincipalGrantResourceType
+  resourceId: string
+  capability: PrincipalGrantCapability
+  expiresAt: Date | null
+  revokedAt: Date | null
+  revokedBy: string | null
+  createdByActorId: string
+  createdAt: Date
+  updatedAt: Date
+}
+
+export interface CreatePrincipalInput {
+  orgId: OrgId
+  name: string
+  kind: PrincipalKind
+  agentId?: AgentId
+  createdByActorId: string
+}
+
+export interface CreatePrincipalGrantInput {
+  orgId: OrgId
+  principalId: string
+  resourceType: PrincipalGrantResourceType
+  resourceId: string
+  capability: PrincipalGrantCapability
+  expiresAt?: Date
+  createdByActorId: string
+}
+
+export interface PrincipalRepo {
+  create(input: CreatePrincipalInput): Promise<PrincipalRecord>
+  get(orgId: OrgId, id: string): Promise<PrincipalRecord | null>
+  getByName(orgId: OrgId, name: string): Promise<PrincipalRecord | null>
+  listForOrg(orgId: OrgId): Promise<PrincipalRecord[]>
+  disable(orgId: OrgId, id: string, actorId: string): Promise<PrincipalRecord | null>
+  enable(orgId: OrgId, id: string, actorId: string): Promise<PrincipalRecord | null>
+  createGrant(input: CreatePrincipalGrantInput): Promise<PrincipalGrantRecord>
+  revokeGrant(orgId: OrgId, grantId: string, actorId: string): Promise<PrincipalGrantRecord | null>
+  listGrantsForPrincipal(orgId: OrgId, principalId: string): Promise<PrincipalGrantRecord[]>
+  getActiveGrant(
+    orgId: OrgId,
+    principalId: string,
+    resourceType: PrincipalGrantResourceType,
+    resourceId: string,
+    capability: PrincipalGrantCapability,
+    now: Date
+  ): Promise<PrincipalGrantRecord | null>
 }
 
 // Atomic publication of a prepared topic/index batch in the existing CP memory home.

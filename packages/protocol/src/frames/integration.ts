@@ -145,6 +145,9 @@ export type IntegrationLinearConfig = z.infer<typeof IntegrationLinearConfig>
 export const ChannelSessionMode = z.enum(['createNew', 'append'])
 export type ChannelSessionMode = z.infer<typeof ChannelSessionMode>
 
+/** Daemon support for continuous conversation sessions. Advertise only once runtime handling ships. */
+export const CONVERSATION_SESSION_MODE_V1_FEATURE = 'conversation-session-mode-v1'
+
 /** One conversation's session mode. Only conversations that depart from the default are sent. */
 export const IntegrationSessionMode = z.object({
   channel: z.string(),

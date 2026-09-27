@@ -42,7 +42,14 @@ import { AgentMutationGate } from '../../src/orchestrator/agentMutationGate.js'
 import { NoConnection } from '../../src/orchestrator/outbound.js'
 import { CollabRoutesService } from '../../src/orchestrator/collabRoutes.service.js'
 import type { RelayControlSender } from '../../src/orchestrator/relayControl.js'
-import type { AnyFrame, CollabRoutesSnapshot, IntegrationUpsert, IntegrationChannel } from '@agentconnect.md/protocol'
+import {
+  CONVERSATION_SESSION_MODE_V1_FEATURE,
+  type AnyFrame,
+  type CollabRoutesSnapshot,
+  type IntegrationUpsert,
+  type IntegrationChannel
+} from '@agentconnect.md/protocol'
+import type { DaemonLiveness } from '../../src/ports.js'
 import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from '../../prisma/seed.js'
 
 // Console routes are org-scoped: /orgs/:orgId/… (devAuth = seeded owner of the default org).
@@ -63,6 +70,28 @@ const CAROL_SUB = 'oidc-carol'
 const DAEMON = 'd1d1d1d1-dddd-4ddd-8ddd-dddddddddddd'
 const OTHER_DAEMON = 'd2d2d2d2-dddd-4ddd-8ddd-dddddddddddd'
 const SLACK = { botToken: 'xoxb-abc-123', appToken: 'xapp-1-def-456' }
+const capableLiveness: DaemonLiveness = {
+  get: (daemonId) =>
+    daemonId === DAEMON
+      ? {
+          state: 'READY',
+          reachable: true,
+          sessionEpoch: 1,
+          capabilities: { features: [CONVERSATION_SESSION_MODE_V1_FEATURE] }
+        }
+      : undefined
+}
+const allCapableLiveness: DaemonLiveness = {
+  get: (daemonId) =>
+    [DAEMON, OTHER_DAEMON].includes(daemonId)
+      ? {
+          state: 'READY',
+          reachable: true,
+          sessionEpoch: 1,
+          capabilities: { features: [CONVERSATION_SESSION_MODE_V1_FEATURE] }
+        }
+      : undefined
+}
 /** The connected Linear organization — the channel itself, since the workspace IS the channel. */
 const LINEAR_WORKSPACE = '5f3a0c9e-1c2b-4a7d-9e10-6b5c4d3e2f10'
 /** A connected workspace's teams — the conversations a Linear bot routes on (§4.5). */
@@ -1821,6 +1850,84 @@ describe('PATCH /integrations/:id/channels/:channelId — session mode', () => {
       ])
     )
 
+  it('rejects append before persistence when daemon capability is unknown', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    spy.upserts.length = 0
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { sessionMode: 'append' }
+    })
+    expect(res.statusCode).toBe(409)
+    expect(res.json().code).toBe('CONVERSATION_SESSION_MODE_UNSUPPORTED')
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
+    expect(spy.upserts).toEqual([])
+  })
+
+  it('rejects a shared-bot append when one sibling placement is old', async () => {
+    await seedDaemon(prisma, DAEMON)
+    await seedDaemon(prisma, OTHER_DAEMON)
+    running = buildHttpApp(prisma, undefined, capableLiveness, new SpyControl() as unknown as ControlSender)
+    const first = await installLinear(running)
+    const second = await addLinearMember(running, first.botId)
+    await prisma.agent.update({ where: { id: second.agentId }, data: { daemonId: OTHER_DAEMON } })
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${first.integrationId}/channels/team_eng`,
+      payload: { sessionMode: 'append' }
+    })
+    expect(res.statusCode).toBe(409)
+    expect(res.json().code).toBe('CONVERSATION_SESSION_MODE_UNSUPPORTED')
+    expect((await modesOf(first.integrationId)).get('team_eng')).toBe('createNew')
+    expect((await modesOf(second.integrationId)).get('team_eng')).toBe('createNew')
+  })
+
+  it('rejects append for a set agent when an idle eligible member is old', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const setId = await seedPoolMember(prisma, OTHER_DAEMON)
+    const idle = 'd3d3d3d3-dddd-4ddd-8ddd-dddddddddddd'
+    await seedPoolMember(prisma, idle)
+    running = buildHttpApp(prisma, undefined, allCapableLiveness, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: { placementKind: 'set', daemonId: null, setId }
+    })
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { sessionMode: 'append' }
+    })
+    expect(res.statusCode).toBe(409)
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
+  })
+
+  it('replicates a shared-bot append after every sibling placement advertises support', async () => {
+    await seedDaemon(prisma, DAEMON)
+    await seedDaemon(prisma, OTHER_DAEMON)
+    running = buildHttpApp(prisma, undefined, allCapableLiveness, new SpyControl() as unknown as ControlSender)
+    const first = await installLinear(running)
+    const second = await addLinearMember(running, first.botId)
+    await prisma.agent.update({ where: { id: second.agentId }, data: { daemonId: OTHER_DAEMON } })
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${first.integrationId}/channels/team_eng`,
+      payload: { sessionMode: 'append' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect((await modesOf(first.integrationId)).get('team_eng')).toBe('append')
+    expect((await modesOf(second.integrationId)).get('team_eng')).toBe('append')
+  })
+
   it('defaults to createNew and is absent from the pushed spec until someone departs from it', async () => {
     await seedDaemon(prisma, DAEMON)
     const spy = new SpyControl()
@@ -1847,7 +1954,7 @@ describe('PATCH /integrations/:id/channels/:channelId — session mode', () => {
   it('a sessionMode-only patch persists, echoes, and reaches the daemon without touching the trigger', async () => {
     await seedDaemon(prisma, DAEMON)
     const spy = new SpyControl()
-    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    running = buildHttpApp(prisma, undefined, capableLiveness, spy as unknown as ControlSender)
     const id = await install(running)
     await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
     await running.app.inject({
@@ -1874,7 +1981,7 @@ describe('PATCH /integrations/:id/channels/:channelId — session mode', () => {
   it('a patch carrying both fields commits both', async () => {
     await seedDaemon(prisma, DAEMON)
     const spy = new SpyControl()
-    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    running = buildHttpApp(prisma, undefined, capableLiveness, spy as unknown as ControlSender)
     const id = await install(running)
     await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
     spy.upserts.length = 0
@@ -1889,6 +1996,36 @@ describe('PATCH /integrations/:id/channels/:channelId — session mode', () => {
     const pushed = spy.upserts[0]!.u
     expect(pushed.core!.mutedChannels).toEqual(['C1'])
     expect(pushed.core!.sessionModes).toEqual([{ channel: 'C1', mode: 'append' }])
+  })
+
+  it('allows reverting append to createNew when daemon support disappears', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    await new PgIntegrationChannelRepo(prisma).setSessionMode(IntegrationId(id), 'C1', 'append')
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { sessionMode: 'createNew' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
+  })
+
+  it('rejects an unknown session mode enum', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { sessionMode: 'forever' }
+    })
+    expect(res.statusCode).toBe(400)
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
   })
 
   it('404s on a conversation the integration does not have', async () => {
@@ -1909,7 +2046,7 @@ describe('PATCH /integrations/:id/channels/:channelId — session mode', () => {
   // conversations refreshes metadata and must never reset it.
   it('survives a re-report of the conversation', async () => {
     await seedDaemon(prisma, DAEMON)
-    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    running = buildHttpApp(prisma, undefined, capableLiveness, new SpyControl() as unknown as ControlSender)
     const id = await install(running)
     await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
     await running.app.inject({

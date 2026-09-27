@@ -2145,6 +2145,7 @@ export interface IntegrationChannelRow {
   /** 'im' = a DM conversation row, 'mpim' = a Slack group DM; absent = channel. */
   kind?: 'channel' | 'im' | 'mpim'
   trigger: 'off' | 'mention' | 'any'
+  sessionMode?: 'createNew' | 'append'
   /** Effective per-conversation owner for a shared bot. */
   agentId?: string | null
 }
@@ -2166,6 +2167,7 @@ export interface IntegrationRow {
   botId?: string
   /** Whether the backing bot is shared (may serve many agents; per-conversation defaults apply). */
   shareable?: boolean
+  supportsAppendSessionMode?: boolean
   /** Discord application (client) id from the backing bot — builds the "Add to Discord" invite URL. Null/absent for non-Discord or when unknown. */
   discordAppId?: string | null
   /** Feishu-family gateway identity. Lark and Feishu integrations remain separate rows even though they share the wire platform key. */

@@ -171,3 +171,5 @@ CLAUDE.local.md
 
 # macOS
 .DS_Store
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

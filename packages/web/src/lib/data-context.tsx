@@ -25,6 +25,7 @@ import {
   type DaemonRow,
   type MemberSetRow,
   type IntegrationRow,
+  type IntegrationChannelRow,
   type Session
 } from '@/lib/data'
 import {
@@ -105,6 +106,12 @@ import {
   type PendingApprovalSession,
   subscribeSessionEvents,
   fetchCrons,
+  fetchStandingWork,
+  approveStandingWork as apiApproveStandingWork,
+  pauseStandingWork as apiPauseStandingWork,
+  resumeStandingWork as apiResumeStandingWork,
+  cancelStandingWork as apiCancelStandingWork,
+  type StandingWorkDto,
   fetchUsage,
   fetchMembers,
   setMemberDirectory,
@@ -252,6 +259,11 @@ interface ConsoleData {
   deleteHook: (id: string, agentId?: string | null) => Promise<void>
   /** Per-conversation trigger choice (PATCH), applied to the local row on success. */
   setChannelTrigger: (integrationId: string, channelId: string, trigger: ChannelTrigger) => Promise<void>
+  setChannelSessionMode: (
+    integrationId: string,
+    channelId: string,
+    sessionMode: NonNullable<IntegrationChannelRow['sessionMode']>
+  ) => Promise<void>
   /** Per-conversation default agent for a shared bot (PATCH), applied locally. */
   setChannelAgent: (integrationId: string, channelId: string, agentId: string) => Promise<void>
   /** Forget a conversation row without touching the platform. */
@@ -267,6 +279,16 @@ interface ConsoleData {
   saveCron: (id: string | null, body: UpsertCronInput) => Promise<void>
   /** Delete a cron, then re-pull. */
   deleteCron: (id: string) => Promise<void>
+  /** Durable Standing Work definitions — inspect + stop only. The console never creates
+   *  or edits one: a definition names policy refs the daemon resolves locally. */
+  standingWork: StandingWorkDto[]
+  standingWorkLoading: boolean
+  /** Fence-checked state change; rejects when the version moved under this page. */
+  transitionStandingWork: (
+    id: string,
+    action: 'approve' | 'pause' | 'resume' | 'cancel',
+    expectedVersion: number
+  ) => Promise<void>
   provisionDaemon: () => Promise<DaemonConnectDto>
   renameDaemon: (daemonId: string, name: string) => Promise<void>
   /** Set the daemon's finished-session retention window ("Expire sessions"), then re-pull. */
@@ -333,6 +355,7 @@ function integrationRowFromDto(
     agentId: d.agentId,
     botId: d.botId,
     shareable: bot?.shareable ?? false,
+    supportsAppendSessionMode: d.supportsAppendSessionMode ?? false,
     discordAppId: bot?.discordAppId ?? null,
     ...(d.platform === 'feishu' ? { region: d.region ?? bot?.feishuRegion ?? 'feishu' } : {}),
     name: d.name,
@@ -352,6 +375,7 @@ function integrationRowFromDto(
       ...(c.url ? { url: c.url } : {}),
       kind: c.kind,
       trigger: c.trigger,
+      sessionMode: c.sessionMode,
       agentId: c.agentId
     }))
   }
@@ -850,6 +874,15 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
   } = useSWR<CronDto[]>(consoleKeys.crons(orgKey), ([, orgId]) => fetchCrons(orgId as string), {
     refreshInterval: RESOURCE_REFRESH_MS
   })
+  // Standing Work definitions. Same cadence as crons — the run timeline below it
+  // polls faster, but a definition's state (expired / completed) only moves server-side.
+  const {
+    data: realStandingWork = [],
+    isLoading: standingWorkIsLoading,
+    mutate: mutateStandingWork
+  } = useSWR<StandingWorkDto[]>(consoleKeys.standingWork(orgKey), ([, orgId]) => fetchStandingWork(orgId as string), {
+    refreshInterval: RESOURCE_REFRESH_MS
+  })
   const {
     data: realIntegrations = [],
     error: integrationsError,
@@ -951,6 +984,7 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
         mutateBots(),
         mutateMcpProviders(),
         mutateMembers(),
+        mutateStandingWork(),
         mutateUsage24h()
       ]),
     [
@@ -962,6 +996,7 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
       mutateBots,
       mutateMcpProviders,
       mutateMembers,
+      mutateStandingWork,
       mutateUsage24h
     ]
   )
@@ -1089,6 +1124,11 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
   // crons: live rows, plus the demo roster in mock mode — so Home's "Scheduled runs"
   // card and the Schedules view are populated with no CP running.
   const crons = useMemo(() => (MOCK_MODE ? [...realCrons, ...MOCK_CRONS] : realCrons), [realCrons])
+
+  // Standing Work: live rows only. There is no demo roster — the surface is inspect +
+  // stop for work a daemon is actually running, so an empty list is the honest mock.
+  const standingWork = realStandingWork
+  const standingWorkLoading = waitingForOrg || standingWorkIsLoading
 
   // bots: live rows, plus the demo roster in mock mode — so the Settings platform
   // cards + the Add-integration reuse picker are populated with no CP running.
@@ -1435,6 +1475,37 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
     [mutateIntegrations, realBots]
   )
 
+  const setChannelSessionMode = useCallback(
+    async (
+      integrationId: string,
+      channelId: string,
+      sessionMode: NonNullable<IntegrationChannelRow['sessionMode']>
+    ) => {
+      await apiUpdateIntegrationChannel(integrationId, channelId, { sessionMode })
+      settleInBackground(
+        mutateIntegrations(
+          (rows) => {
+            const source = rows?.find((row) => row.id === integrationId)
+            if (!rows || !source) return rows
+            const botWide = realBots.some((bot) => bot.id === source.botId && bot.shareable)
+            return rows.map((row) =>
+              (botWide ? row.botId === source.botId : row.id === integrationId)
+                ? {
+                    ...row,
+                    channels: row.channels.map((channel) =>
+                      channel.channelId === channelId ? { ...channel, sessionMode } : channel
+                    )
+                  }
+                : row
+            )
+          },
+          { revalidate: false }
+        )
+      )
+    },
+    [mutateIntegrations, realBots]
+  )
+
   /**
    * Drop a conversation from the cache. Both channel actions end the same way — the
    * row is gone — so they share one projection, applied bot-wide for a channel of a
@@ -1551,6 +1622,26 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
     [mutateCrons]
   )
 
+  // A Standing Work state change. The CP answers 409 when the version moved under
+  // this page, so the caller surfaces that and we re-pull either way — a conflict
+  // is exactly when the list is stale.
+  const transitionStandingWork = useCallback(
+    async (id: string, action: 'approve' | 'pause' | 'resume' | 'cancel', expectedVersion: number) => {
+      const call = {
+        approve: apiApproveStandingWork,
+        pause: apiPauseStandingWork,
+        resume: apiResumeStandingWork,
+        cancel: apiCancelStandingWork
+      }[action]
+      try {
+        await call(id, expectedVersion)
+      } finally {
+        settleInBackground(mutateStandingWork())
+      }
+    },
+    [mutateStandingWork]
+  )
+
   // One-shot: mint a connect token + start command. The daemon row shows up via
   // `refresh()` once the started process authenticates, so this doesn't refresh.
   const provisionDaemon = useCallback(() => apiProvisionDaemon(), [])
@@ -1648,6 +1739,8 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
       sessionStreamGeneration,
       revalidateSessionLists,
       crons,
+      standingWork,
+      standingWorkLoading,
       integrations,
       bots,
       mcpProviders,
@@ -1695,12 +1788,14 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
       deleteHook,
       deleteBot,
       setChannelTrigger,
+      setChannelSessionMode,
       forgetChannel,
       leaveConversation,
       setChannelAgent,
       setBotShareable,
       saveCron,
       deleteCron,
+      transitionStandingWork,
       provisionDaemon,
       renameDaemon,
       setDaemonSessionRetention,
@@ -1731,6 +1826,8 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
       sessionStreamGeneration,
       revalidateSessionLists,
       crons,
+      standingWork,
+      standingWorkLoading,
       integrations,
       bots,
       mcpProviders,
@@ -1778,10 +1875,12 @@ export function ConsoleDataProvider({ children }: { children: ReactNode }) {
       deleteHook,
       deleteBot,
       setChannelTrigger,
+      setChannelSessionMode,
       setChannelAgent,
       setBotShareable,
       saveCron,
       deleteCron,
+      transitionStandingWork,
       provisionDaemon,
       renameDaemon,
       setDaemonSessionRetention,

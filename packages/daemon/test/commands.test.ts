@@ -2,12 +2,14 @@ import { describe, it, expect } from 'vitest'
 import { parseCommand } from '../src/commands/commands.js'
 
 describe('parseCommand', () => {
-  it('parses !stop, !cancel, and !resume as distinct commands', () => {
+  it('parses !stop, !cancel, !resume, and !new as distinct commands', () => {
     expect(parseCommand('!stop')).toEqual({ kind: 'stop' })
     expect(parseCommand('!cancel')).toEqual({ kind: 'cancel' })
     expect(parseCommand('/cancel')).toEqual({ kind: 'cancel' })
     expect(parseCommand('!resume')).toEqual({ kind: 'resume' })
     expect(parseCommand('/resume')).toEqual({ kind: 'resume' })
+    expect(parseCommand('!new')).toEqual({ kind: 'new' })
+    expect(parseCommand('/new')).toEqual({ kind: 'new' })
   })
 
   it('parses the / prefix too (for non-Slack platforms)', () => {
@@ -43,6 +45,7 @@ describe('parseCommand', () => {
     expect(parseCommand('/status@my_bot')).toEqual({ kind: 'status' })
     expect(parseCommand('/stop@my_bot')).toEqual({ kind: 'stop' })
     expect(parseCommand('/resume@my_bot')).toEqual({ kind: 'resume' })
+    expect(parseCommand('/new@my_bot')).toEqual({ kind: 'new' })
     expect(parseCommand('/fast@my_bot on')).toEqual({ kind: 'fast', enable: true })
     expect(parseCommand('/models@my_bot opus')).toEqual({ kind: 'model', value: 'opus' })
     // the @botname is not folded into the queue payload

@@ -27,7 +27,8 @@ import type {
   GithubInstallationRepo,
   DaemonLifecycleOpRepo,
   AgentRecord,
-  AgentMemoryHistoryRepo
+  AgentMemoryHistoryRepo,
+  AuditRepo
 } from '../persistence/ports.js'
 import type { AgentMemoryStoreService } from '../agent-memory/store.service.js'
 import type { UsageWriter } from '../usage/writer.js'
@@ -43,6 +44,7 @@ import type { GithubRunCoordinator } from '../github/run-reporter.js'
 import type { CodeHostNoteProjectionService } from '../codehost/note-projection.service.js'
 import type { GiteaStatusCoordinator } from '../gitea/status-projection.js'
 import type { ReconcileService } from '../orchestrator/placement.js'
+import type { StandingWorkRepo } from '../standing-work/contracts.js'
 import type { ConnectionRegistry } from './registry.js'
 import type { Clock } from '../domain/clock.js'
 import type { SessionEventSink } from '../events/sink.js'
@@ -138,6 +140,10 @@ export interface DaemonWsDeps {
   agentBundle?: (agent: AgentRecord) => Promise<DutyAgentBundle>
   /** Stamps `lastRunAt` from the `cron/report` EVT (daemon-scoped, latest-wins). */
   cron: CronRepo
+  /** Projects `standing-work/report` into the operator's run + delivery timeline (daemon-authoritative, fenced). */
+  standingWork: StandingWorkRepo
+  /** Records the daemon execution trail ingested by `audit/flush`, deduplicated on `eventId`. */
+  audit: AuditRepo
   /** Closes `HookRun` rows from the correlated `hook/report` completion request. */
   hook: HookRepo
   /** Viewer-free agent reads for the `gitcred/request` placement check — a DATA-PLANE

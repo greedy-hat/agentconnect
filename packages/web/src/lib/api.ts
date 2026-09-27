@@ -876,6 +876,7 @@ export interface SlackConfigInput {
 // How the bot activates in one conversation: not at all ('off' — conversation
 // gating for restricted agents), only when @-mentioned, or on any message.
 export type ChannelTrigger = 'off' | 'mention' | 'any'
+export type ChannelSessionMode = 'createNew' | 'append'
 
 // One conversation the integration's bot is in (daemon-reported) + its trigger
 // choice. kind 'im' rows are DM conversations and 'mpim' rows are Slack group DMs;
@@ -892,6 +893,7 @@ export interface IntegrationChannelDto {
   isPrivate: boolean
   kind: 'channel' | 'im' | 'mpim'
   trigger: ChannelTrigger
+  sessionMode: ChannelSessionMode
   agentId: string | null // effective shared-conversation owner; null before convergence / when not applicable
 }
 
@@ -905,6 +907,7 @@ export interface IntegrationDto {
   status: string
   region?: 'feishu' | 'lark' // feishu integrations only: which open-platform gateway
   createdAt: string // ISO-8601
+  supportsAppendSessionMode: boolean
   channels: IntegrationChannelDto[]
 }
 
@@ -4203,7 +4206,7 @@ export async function fetchHookRuns(id: string, orgId?: string): Promise<HookRun
 export async function updateIntegrationChannel(
   integrationId: string,
   channelId: string,
-  patch: { trigger?: ChannelTrigger; agentId?: string },
+  patch: { trigger?: ChannelTrigger; sessionMode?: ChannelSessionMode; agentId?: string },
   orgId?: string
 ): Promise<IntegrationChannelDto> {
   return apiPatch<IntegrationChannelDto>(
@@ -5973,6 +5976,122 @@ export async function runCronNow(id: string): Promise<void> {
   await apiPost<null>(`${orgBase()}/crons/${encodeURIComponent(id)}/run`, {})
 }
 
+// ── standing work ────────────────────────────────────────────────────────────
+// Durable, fixed-schedule ambient work (`/standing-work`). Where a cron posts one
+// prompt per tick, a Standing Work item keeps a goal across runs and only notifies
+// when its outcome changed. The CP stores the definition and the daemon-reported
+// run history; the daemon executes. The console INSPECTS and STOPS here — it does
+// not create or edit, because a definition is a standing commitment the daemon
+// holds policy refs for.
+export interface StandingWorkDestinationDto {
+  platform: string
+  integrationId: string
+  channel: string
+  thread?: string
+}
+
+export interface StandingWorkDto {
+  id: string
+  orgId: string
+  agentId: string
+  principalId: string
+  name: string
+  objective: string
+  state: 'active' | 'paused' | 'completed' | 'expired' | 'cancelled'
+  definitionVersion: number
+  approvalState: 'pending' | 'approved' | 'denied'
+  approvalVersion: number | null
+  schedule: string
+  timezone: string
+  startAt: string
+  expiresAt: string
+  scheduleMode: 'fixed' | 'adaptive'
+  minIntervalSeconds: number
+  maxIntervalSeconds: number
+  wakeOnConversation: boolean
+  maxRunsPerDay: number
+  maxNotificationsPerDay: number
+  conversationRef: StandingWorkDestinationDto | null
+  targetDestination: StandingWorkDestinationDto
+  budgetPolicyRef: string
+  toolPolicyRef: string
+  notificationPolicy: { mode: 'changes' | 'all'; includeCompletion: boolean }
+  visibilityPolicyRef: string
+  sourceSessionId: string | null
+  createdByActorId: string
+  lastModifiedByActorId: string
+  approvedByActorId: string | null
+  authorizationRevision: number
+  createdAt: string
+  updatedAt: string
+}
+
+// One daemon-reported run. `outcome` (what the turn decided) and `notification`
+// (whether the message arrived) are SEPARATE facts: a committed `notify` run can
+// still have a `pending`, `sending` or `uncertain` delivery, and `uncertain` is
+// never folded into delivered/failed.
+export interface StandingWorkRunDto {
+  runId: string
+  workId: string
+  definitionVersion: number
+  executionEpoch: number
+  attempt: number
+  outcome: 'no_change' | 'notify' | 'blocked' | 'complete' | 'failed'
+  startedAt: string
+  finishedAt: string | null
+  sessionId: string | null
+  errorCode: string | null
+  suggestedNextCheckAt: string | null
+  wakeSource: 'scheduled' | 'conversation'
+  notification: {
+    notificationIndex: number
+    effectId: string
+    status: 'pending' | 'sending' | 'delivered' | 'uncertain' | 'failed' | 'suppressed'
+    providerReceipt: string | null
+    error: string | null
+  } | null
+}
+
+export async function fetchStandingWork(orgId?: string): Promise<StandingWorkDto[]> {
+  return apiGet<StandingWorkDto[]>(`${orgBase(orgId)}/standing-work`)
+}
+
+export async function fetchStandingWorkRuns(
+  id: string,
+  orgId?: string,
+  page?: { limit?: number; before?: { startedAt: string; runId: string } }
+): Promise<StandingWorkRunDto[]> {
+  const query = new URLSearchParams()
+  if (page?.limit !== undefined) query.set('limit', String(page.limit))
+  if (page?.before) {
+    query.set('beforeStartedAt', page.before.startedAt)
+    query.set('beforeRunId', page.before.runId)
+  }
+  const encoded = query.toString()
+  const suffix = encoded ? `?${encoded}` : ''
+  return apiGet<StandingWorkRunDto[]>(`${orgBase(orgId)}/standing-work/${encodeURIComponent(id)}/runs${suffix}`)
+}
+
+// Every state change is fenced on the version the console last read, so a stale
+// page 409s instead of overwriting what someone else changed. Approve is
+// owner-only; the rest need any write role.
+async function standingWorkAction(
+  id: string,
+  action: 'approve' | 'pause' | 'resume' | 'cancel',
+  expectedVersion: number
+): Promise<StandingWorkDto> {
+  return apiPost<StandingWorkDto>(`${orgBase()}/standing-work/${encodeURIComponent(id)}/${action}`, { expectedVersion })
+}
+
+export const approveStandingWork = (id: string, expectedVersion: number) =>
+  standingWorkAction(id, 'approve', expectedVersion)
+export const pauseStandingWork = (id: string, expectedVersion: number) =>
+  standingWorkAction(id, 'pause', expectedVersion)
+export const resumeStandingWork = (id: string, expectedVersion: number) =>
+  standingWorkAction(id, 'resume', expectedVersion)
+export const cancelStandingWork = (id: string, expectedVersion: number) =>
+  standingWorkAction(id, 'cancel', expectedVersion)
+
 // ── organization knowledge + managed skills ─────────────────────────────────
 
 export interface OrganizationKnowledgeDto {
@@ -6243,5 +6362,159 @@ export function deleteAgentMemoryEntry(
   return apiDelete<import('@agentconnect.md/protocol').MemoryEntryMutationReceipt>(
     memoryEntryUrl(agentId, 'entries', channelKey),
     request
+  )
+}
+
+// ── I1: Principal Identity ──────────────────────────────────────────────────
+
+export interface PrincipalDto {
+  id: string
+  orgId: string
+  name: string
+  kind: 'agent' | 'service' | 'delegated'
+  agentId: string | null
+  state: 'active' | 'disabled'
+  disabledAt: string | null
+  disabledBy: string | null
+  authorizationRevision: number
+  createdByActorId: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface PrincipalGrantDto {
+  id: string
+  orgId: string
+  principalId: string
+  resourceType: 'repo' | 'destination' | 'tool'
+  resourceId: string
+  capability: 'read' | 'comment' | 'write' | 'execute' | 'notify'
+  expiresAt: string | null
+  revokedAt: string | null
+  revokedBy: string | null
+  createdByActorId: string
+  createdAt: string
+  updatedAt: string
+}
+
+export async function fetchPrincipals(orgId?: string): Promise<PrincipalDto[]> {
+  const res = await apiGet<{ principals: PrincipalDto[] }>(`${orgBase(orgId)}/principals`)
+  return res.principals
+}
+
+export async function fetchPrincipal(id: string, orgId?: string): Promise<PrincipalDto> {
+  return apiGet<PrincipalDto>(`${orgBase(orgId)}/principals/${encodeURIComponent(id)}`)
+}
+
+export async function createPrincipal(
+  body: { name: string; kind: 'agent' | 'service' | 'delegated'; agentId?: string },
+  orgId?: string
+): Promise<PrincipalDto> {
+  return apiPost<PrincipalDto>(`${orgBase(orgId)}/principals`, body)
+}
+
+export async function disablePrincipal(id: string): Promise<PrincipalDto> {
+  return apiPost<PrincipalDto>(`${orgBase()}/principals/${encodeURIComponent(id)}/disable`, {})
+}
+
+export async function enablePrincipal(id: string): Promise<PrincipalDto> {
+  return apiPost<PrincipalDto>(`${orgBase()}/principals/${encodeURIComponent(id)}/enable`, {})
+}
+
+export async function fetchPrincipalGrants(principalId: string, orgId?: string): Promise<PrincipalGrantDto[]> {
+  const res = await apiGet<{ grants: PrincipalGrantDto[] }>(
+    `${orgBase(orgId)}/principals/${encodeURIComponent(principalId)}/grants`
+  )
+  return res.grants
+}
+
+export async function createPrincipalGrant(
+  principalId: string,
+  body: {
+    resourceType: 'repo' | 'destination' | 'tool'
+    resourceId: string
+    capability: 'read' | 'comment' | 'write' | 'execute' | 'notify'
+    expiresAt?: string
+  }
+): Promise<PrincipalGrantDto> {
+  return apiPost<PrincipalGrantDto>(`${orgBase()}/principals/${encodeURIComponent(principalId)}/grants`, body)
+}
+
+export async function revokePrincipalGrant(principalId: string, grantId: string): Promise<PrincipalGrantDto> {
+  return apiPost<PrincipalGrantDto>(
+    `${orgBase()}/principals/${encodeURIComponent(principalId)}/grants/${encodeURIComponent(grantId)}/revoke`,
+    {}
+  )
+}
+
+// ── Audit (A1 unified audit, roadmap §6) ────────────────────────────────────
+
+/** One row of the org's execution trail. The causal identifiers are nullable because a CP-native
+ *  control event (a key rotate, a principal grant) carries none of them. */
+export interface AuditEventDto {
+  id: string
+  kind: string
+  orgId: string | null
+  daemonId: string | null
+  agentId: string | null
+  sessionId: string | null
+  actorUserId: string | null
+  message: string | null
+  /** Already redacted at the source; the console renders it, never sends it onward. */
+  details: unknown
+  eventId: string | null
+  traceId: string | null
+  parentEventId: string | null
+  effectId: string | null
+  principalId: string | null
+  source: 'cp' | 'daemon'
+  occurredAt: string | null
+  createdAt: string
+}
+
+export interface AuditPage {
+  events: AuditEventDto[]
+  nextCursor: string | null
+}
+
+export interface AuditFilters {
+  kinds?: string
+  traceId?: string
+  effectId?: string
+  agentId?: string
+  daemonId?: string
+  sessionId?: string
+  principalId?: string
+  from?: string
+  to?: string
+}
+
+/** Empty and unset mean the same query to the CP, so only a filled filter is sent. */
+function appendAuditFilters(q: URLSearchParams, filters: AuditFilters): void {
+  for (const [key, value] of Object.entries(filters)) if (value) q.set(key, value)
+}
+
+export async function fetchAuditEvents(
+  cursor?: string,
+  limit = 50,
+  orgId?: string,
+  filters: AuditFilters = {}
+): Promise<AuditPage> {
+  const q = new URLSearchParams({ limit: String(limit) })
+  if (cursor) q.set('cursor', cursor)
+  appendAuditFilters(q, filters)
+  return apiGet<AuditPage>(`${orgBase(orgId)}/audit?${q.toString()}`)
+}
+
+/** The bounded JSON export — the CP pages its own ceiling, and `truncated` says it hit it. */
+export async function exportAuditEvents(
+  orgId?: string,
+  filters: AuditFilters = {}
+): Promise<{ events: AuditEventDto[]; truncated: boolean; exportedAt: string }> {
+  const q = new URLSearchParams()
+  appendAuditFilters(q, filters)
+  const query = q.toString()
+  return apiGet<{ events: AuditEventDto[]; truncated: boolean; exportedAt: string }>(
+    `${orgBase(orgId)}/audit/export${query ? `?${query}` : ''}`
   )
 }
