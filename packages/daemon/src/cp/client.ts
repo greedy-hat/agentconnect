@@ -26,6 +26,9 @@ import type {
   SessionPurged,
   IntegrationChannels,
   CronReport,
+  StandingWorkRunReport,
+  AuditEventEnvelope,
+  AuditFlushOk,
   HookReport,
   HookStart,
   HookStartOk,
@@ -115,6 +118,7 @@ import type { SkillsControlDeps } from './control/skills.js'
 import type { TaskControlDeps } from './control/task.js'
 import type { AutoMergeControlDeps } from './control/automerge.js'
 import type { SandboxKeepAliveDeps } from './control/sandbox-keepalive.js'
+import type { StandingWorkControlDeps } from './control/standing-work.js'
 import { GitMessagePasses, type WorkspaceReadDeps } from './control/workspace.js'
 import type { ConfigApply } from './config-apply.js'
 import type { Logger } from '../log.js'
@@ -166,6 +170,7 @@ export interface CpClientDeps
     TaskControlDeps,
     AutoMergeControlDeps,
     SandboxKeepAliveDeps,
+    StandingWorkControlDeps,
     CodeHostControlDeps,
     WorkspaceReadDeps {
   url: string
@@ -325,6 +330,7 @@ export class CpClient {
       taskReader: deps.taskReader,
       autoMerge: deps.autoMerge,
       sandboxKeepAlive: deps.sandboxKeepAlive,
+      standingWorkControl: deps.standingWorkControl,
       executorPrepare: deps.executorPrepare,
       agentWake: deps.agentWake,
       memoryReader: deps.memoryReader,
@@ -821,6 +827,29 @@ export class CpClient {
   emitCronReport(report: CronReport): void {
     if (this.state !== 'READY' && this.state !== 'DRAINING') return
     this.transport?.send(encode(this.scopedFrame('cron/report', report)))
+  }
+
+  /**
+   * Report one standing-work ambient run (D→C `standing-work/report` EVT, fire-and-forget) so the
+   * operator console's timeline converges. The daemon's local run row stays authoritative and the CP
+   * upsert is latest-wins, so re-asserting the stored feed on each (re)connect (see onReady in
+   * cp-client-deps.ts) makes a dropped report only a delay, never a loss. No-op unless READY/DRAINING.
+   */
+  emitStandingWorkReport(report: StandingWorkRunReport): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    this.transport?.send(encode(this.scopedFrame('standing-work/report', report)))
+  }
+
+  /** Durably ingest one org's audit batch (D→C `audit/flush` REQ). The reply names which event ids the
+   *  control plane settled, so the caller releases exactly those rows and keeps the rest; an explicit
+   *  org is required because a batch spans agents and the envelope cannot infer one from a payload. */
+  async emitAuditFlush(orgId: string, events: AuditEventEnvelope[]): Promise<AuditFlushOk> {
+    this.requireReady('audit/flush')
+    const rep = await this.request('audit/flush', { events }, orgId)
+    if (rep.type !== 'audit/flush/ok') {
+      throw new WireError('INTERNAL', `expected audit/flush/ok, got ${rep.type}`, true)
+    }
+    return rep.payload as AuditFlushOk
   }
 
   /**

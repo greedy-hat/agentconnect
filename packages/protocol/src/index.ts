@@ -56,8 +56,10 @@ export {
   SESSION_EXECUTORS_V1_FEATURE,
   SESSION_LIVE_TAIL_FEATURE,
   SESSION_METADATA_ACK_FEATURE,
+  EXECUTION_AUDIT_V1_FEATURE,
   SESSION_PURGE_FEATURE,
   SESSION_VISIBILITY_FEATURE,
+  STANDING_WORK_FIXED_V1_FEATURE,
   SLACK_SESSION_AUDIENCE_FEATURE,
   TASK_LIST_FEATURE,
   AUTO_MERGE_FEATURE,
@@ -87,6 +89,8 @@ export * from './frames/collab.js'
 export * from './frames/route.js'
 export * from './frames/agent.js'
 export * from './frames/cron.js'
+export * from './frames/standing-work.js'
+export * from './frames/audit.js'
 export * from './frames/duty.js'
 export * from './frames/executor.js'
 export * from './frames/hook.js'

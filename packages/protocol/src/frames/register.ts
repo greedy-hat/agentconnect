@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { Platform, RouteAssign } from './route.js'
 import { CronUpsert } from './cron.js'
+import { StandingWorkProjection } from './standing-work.js'
 import { SecretsGrant } from './secrets.js'
 import { AgentSpec } from './agent.js'
 import { IntegrationSpec } from './integration.js'
@@ -132,6 +133,7 @@ export const RegisterOk = z.object({
   assignments: z.array(RouteAssign), // the route/assign set the daemon SHOULD own
   agents: z.array(AgentSpec.extend({ agentId: z.string().uuid() })).default([]), // spec set CP wants present; daemon converges
   crons: z.array(CronUpsert), // the cron set it SHOULD run
+  standingWorks: z.array(StandingWorkProjection).default([]),
   // Platform integrations this daemon SHOULD hold — FILTERED to this daemon (never
   // org-wide), since each element carries plaintext tokens. Never log this array.
   integrations: z.array(IntegrationSpec).default([]),

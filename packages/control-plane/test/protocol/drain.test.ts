@@ -151,6 +151,8 @@ function build(): Built {
     collabRoutes: {} as DaemonWsDeps['collabRoutes'],
     dutyLease: {} as DaemonWsDeps['dutyLease'],
     cron: {} as DaemonWsDeps['cron'],
+    standingWork: {} as DaemonWsDeps['standingWork'],
+    audit: {} as DaemonWsDeps['audit'],
     hook: {} as DaemonWsDeps['hook'],
     relayRoster: async () => [],
     clock,

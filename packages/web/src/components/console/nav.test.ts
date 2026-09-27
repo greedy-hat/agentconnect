@@ -33,12 +33,14 @@ describe('navVisible', () => {
 
   it('reaches the same verdict in every table, so no surface can offer what the rail hides', () => {
     const tables = () => [offered(NAV_GROUPS.flat()), offered(MORE_ROWS), offered(SEARCH_PAGES)]
-
-    setFlags()
-    for (const hrefs of tables()) expect(hrefs).not.toContain('/billing')
-
-    setFlags('billing')
-    for (const hrefs of tables()) expect(hrefs).toContain('/billing')
+    // One pass per flagged destination whose route is its own table row: off hides it from every
+    // surface, on offers it from every surface. A rail entry with no search entry is the drift.
+    for (const flag of ['billing', 'standing-work', 'principals', 'audit']) {
+      setFlags()
+      for (const hrefs of tables()) expect(hrefs, `flag ${flag} off`).not.toContain(`/${flag}`)
+      setFlags(flag)
+      for (const hrefs of tables()) expect(hrefs, `flag ${flag} on`).toContain(`/${flag}`)
+    }
   })
 
   it('leaves the rest of the rail alone when a flag is off', () => {

@@ -1,3 +1,5 @@
+import type { ExecutionAuditKind } from '@agentconnect.md/protocol'
+
 /**
  * The small, daemon-owned execution contract used before autonomous work is
  * admitted.  It deliberately has no provider payloads: those are untrusted
@@ -70,11 +72,38 @@ export function authorizeTool(policy: ExecutionPolicy, capabilities: ExecutionCa
   return nonEmpty(tool) && policy.allowedTools.has(tool) && capabilities.tools.has(tool)
 }
 
+/** What an audit record may truthfully state. An ambient run is admitted before its session exists and
+ *  its external effect is swept on a later tick, so a session is a fact that may still be absent —
+ *  omitted, never fabricated. Admission itself stays strict on {@link ExecutionProvenance}.
+ *  `parentEventId` is NOT provenance: it names another audit row, so it belongs to the event. */
+export type AuditProvenance = Omit<ExecutionProvenance, 'sessionId' | 'executionEpoch' | 'parentEventId'> & {
+  readonly sessionId?: string
+  readonly executionEpoch?: number
+}
+
+/** Every identity dimension an audit row is keyed by must be present; a partial subject is not auditable. */
+export function isAuditableProvenance(provenance: AuditProvenance): boolean {
+  return (
+    nonEmpty(provenance.orgId) &&
+    nonEmpty(provenance.agentId) &&
+    nonEmpty(provenance.principalId) &&
+    nonEmpty(provenance.traceId) &&
+    nonEmpty(provenance.runId) &&
+    (provenance.executionEpoch === undefined ||
+      (Number.isSafeInteger(provenance.executionEpoch) && provenance.executionEpoch >= 0))
+  )
+}
+
+/** One fact about a daemon-owned execution, as it enters the durable outbox. The kind vocabulary and the
+ *  wire shape are the protocol's, so a record cannot be written that the control plane would refuse. */
 export interface DurableAuditEvent {
   readonly eventId: string
-  readonly kind: 'admission' | 'admission_denied' | 'tool_intent' | 'tool_result' | 'budget_reserved' | 'budget_settled'
-  readonly provenance: ExecutionProvenance
+  readonly kind: ExecutionAuditKind
+  readonly provenance: AuditProvenance
   readonly occurredAt: number
+  /** Causal pointers to other audit rows; both are plain ids, never foreign keys. */
+  readonly effectId?: string
+  readonly parentEventId?: string
   readonly details?: Record<string, unknown>
 }
 

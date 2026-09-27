@@ -826,7 +826,28 @@ describe('POST /api/v1/mcp — tools act with the caller’s own authority', () 
         repoFullName: 'acme/api',
         family: 'pull_request',
         events: ['pull_request:opened']
-      }
+      },
+      // Standing Work tools — unknown ids yield 404 from the handler, not route drift.
+      getStandingWork: { workId: randomUUID() },
+      listStandingWorkRuns: { workId: randomUUID() },
+      createStandingWork: {
+        agentId: randomUUID(),
+        name: 'edge',
+        objective: 'Watch the rollout',
+        schedule: '0 9 * * *',
+        timezone: 'UTC',
+        startAt: new Date(Date.now() + 3_600_000).toISOString(),
+        expiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+        targetDestination: { platform: 'slack', integrationId: randomUUID(), channel: 'C1' },
+        budgetPolicyRef: 'default',
+        toolPolicyRef: 'read-only',
+        notificationPolicy: { mode: 'changes', includeCompletion: true },
+        visibilityPolicyRef: 'agent'
+      },
+      pauseStandingWork: { workId: randomUUID(), expectedVersion: 1 },
+      resumeStandingWork: { workId: randomUUID(), expectedVersion: 1 },
+      cancelStandingWork: { workId: randomUUID(), expectedVersion: 1, confirm: 'x' },
+      approveStandingWork: { workId: randomUUID(), expectedVersion: 1 }
     }
     // The GitHub read family exists only where the deployment configured an App,
     // so those two tools are probed against an app that has one — otherwise their

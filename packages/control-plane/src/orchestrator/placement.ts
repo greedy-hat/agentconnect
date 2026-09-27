@@ -37,7 +37,7 @@ import type {
   McpServerSpec,
   MemoryConnectionSpec
 } from '@agentconnect.md/protocol'
-import { SessionRetentionSetting } from '@agentconnect.md/protocol'
+import { SessionRetentionSetting, STANDING_WORK_FIXED_V1_FEATURE } from '@agentconnect.md/protocol'
 import type {
   AgentRepo,
   AgentRecord,
@@ -65,7 +65,14 @@ import {
   type McpDefinitionDeps,
   type MemoryDefinitionDeps
 } from './agentDefinitions.js'
-import { daemonSupportsAgent, encodeSpecWorkspaceForPeer, requiredDaemonFeatures } from '../domain/daemon-features.js'
+import {
+  advertises,
+  daemonSupportsAgent,
+  encodeSpecWorkspaceForPeer,
+  requiredDaemonFeatures
+} from '../domain/daemon-features.js'
+import { standingWorkProjection } from '../standing-work/projection.js'
+import type { StandingWorkDefinitionRepo } from '../standing-work/contracts.js'
 import { daemonSupportsIntegration, requiredIntegrationFeatures } from '../domain/integration-features.js'
 import type { AgentId, DaemonId } from '../domain/ids.js'
 import { AgentId as toAgentId, DaemonId as toDaemonId, IntegrationId as toIntegrationId } from '../domain/ids.js'
@@ -97,6 +104,9 @@ export interface PlacementOrchDeps {
    *  optional seam — absent (tests / no orch) ⇒ reconcile ships no MCP defs. */
   mcp?: McpDefinitionDeps
   memory?: MemoryDefinitionDeps
+  /** Fixed Standing Work definitions (W1 store). Projected to a daemon ONLY when it
+   *  advertises `standing-work-fixed-v1`; absent (tests / no gate) ⇒ no definitions ship. */
+  standingWork?: StandingWorkDefinitionRepo
   /** The duty ledger read that makes the reconcile roster `pinned-to-me ∪ agents
    *  in the duties I hold`. Absent (tests / no pool) ⇒ placement alone. */
   duties?: { heldAgentIds(holder: DaemonId, now: Date): Promise<AgentId[]> }
@@ -695,6 +705,16 @@ export class Placement implements ReconcileService {
     // daemon reads as "keep local config".
     const sessionRetention = SessionRetentionSetting.safeParse(daemon.sessionRetention)
 
+    // W6 release gate: a fixed Standing Work definition reaches only a daemon that has
+    // advertised the complete `standing-work-fixed-v1` capability. An absent repo or an
+    // unadvertised feature projects nothing — mixed/unknown peers fail closed.
+    const standingWorks =
+      this.orch?.standingWork && advertises(req.capabilities.features, [STANDING_WORK_FIXED_V1_FEATURE])
+        ? (await this.orch.standingWork.listForAgents(deliverableAgents.map((agent) => agent.id as string))).map(
+            standingWorkProjection
+          )
+        : []
+
     return {
       routingEpoch: Number(daemon.routingEpoch), // re-issue same — convergence, not bump
       ...(sessionRetention.success ? { sessionRetention: sessionRetention.data } : {}),
@@ -714,6 +734,7 @@ export class Placement implements ReconcileService {
       mcpServers: await this.desiredMcpServers(daemonId, ownedAgents), // token-bearing (relay url + grant key)
       memoryConnections: await this.desiredMemoryConnections(daemonId, ownedAgents),
       leases: desiredLeases,
+      standingWorks,
       relays: [], // relay roster — populated once CP relay orchestration lands (shared-bot-relay.md A2)
       collabRoutes, // bot-agnostic collaboration routing snapshot (agent-collaboration P2)
       drop: {

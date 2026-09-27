@@ -32,7 +32,8 @@ function harness(features: readonly string[] | undefined) {
       },
       integrationRemove: async () => {},
       cronUpsert: async () => ({ ok: true }),
-      cronRemove: async () => ({ ok: true })
+      cronRemove: async () => ({ ok: true }),
+      standingWorkControl: async () => ({ ok: true })
     },
     specs: { assemble: async () => ({ agentId: 'a' }) } as unknown as AgentSpecAssembler,
     daemonFeatures: () => features

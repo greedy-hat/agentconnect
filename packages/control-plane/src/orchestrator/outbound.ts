@@ -128,7 +128,8 @@ import {
   SessionVisibilityOk,
   SessionPullRequestFeedback,
   SessionPullRequestFeedbackResult,
-  CodeHostNoteDesired
+  CodeHostNoteDesired,
+  StandingWorkControl
 } from '@agentconnect.md/protocol'
 /**
  * `ControlSender` (design §4.7, the single fencing site) — the ONLY place that
@@ -543,6 +544,14 @@ export class ControlSender {
   async cronRun(daemonId: string, r: CronRunNow): Promise<Ack> {
     const c = this.must(daemonId)
     return c.conn.request<Ack>('cron/run', r, { epoch: c.sessionEpoch })
+  }
+
+  /** Push a lifecycle decision (approve/pause/resume/cancel) to a running daemon.
+   *  Explicit orgId for the same reason as `cronRemove`: a duty holder that did not
+   *  register the standing work cannot resolve the org from its own maps. */
+  async standingWorkControl(daemonId: string, p: StandingWorkControl, orgId?: string): Promise<Ack> {
+    const c = this.must(daemonId)
+    return c.conn.request<Ack>('standing-work/control', p, { epoch: c.sessionEpoch }, undefined, orgId)
   }
 
   /**

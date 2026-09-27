@@ -1048,6 +1048,167 @@ export const MCP_TOOLS: McpToolDef[] = [
       if (typeof found.name !== 'string' || found.name !== a.confirm) return confirmMismatch('the integration’s `name`')
       return ctx.send('DELETE', org(ctx, `/integrations/${seg(a.integrationId)}`))
     }
+  },
+  {
+    name: 'listStandingWork',
+    description: 'List Standing Work items (scheduled ambient objectives) visible to you.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/standing-work'))
+  },
+  {
+    name: 'getStandingWork',
+    description: 'Get one Standing Work item by id.',
+    schema: z.object({ workId: z.string().uuid().describe('The Standing Work id (from listStandingWork)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/standing-work/${seg(a.workId)}`))
+  },
+  {
+    name: 'listStandingWorkRuns',
+    description: 'Run history for a Standing Work item, newest first (outcome, notification delivery status).',
+    schema: z.object({ workId: z.string().uuid().describe('The Standing Work id (from listStandingWork)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/standing-work/${seg(a.workId)}/runs`))
+  },
+  {
+    name: 'createStandingWork',
+    description:
+      'Propose a Standing Work item: a fixed-schedule ambient objective for an agent with a hard expiry, a delivery destination, and policy refs. Requires owner approval before it runs.',
+    write: true,
+    schema: z
+      .object({
+        agentId: z.string().uuid().describe('The agent this objective drives (from listAgents)'),
+        name: z.string().trim().min(1).max(200).describe('Short display name for the objective'),
+        objective: z
+          .string()
+          .trim()
+          .min(1)
+          .max(16_000)
+          .describe('The full objective text the agent pursues on each firing'),
+        schedule: z.string().min(1).max(200).describe('5-field cron expression'),
+        timezone: z.string().min(1).max(100).describe('IANA timezone the schedule is interpreted in'),
+        startAt: z.string().min(1).describe('ISO-8601 start (must be in the future)'),
+        expiresAt: z.string().min(1).describe('ISO-8601 expiry (max 90 days from now, after startAt)'),
+        targetDestination: z
+          .object({
+            platform: z.string().min(1).max(64),
+            integrationId: z.string().uuid(),
+            channel: z.string().min(1).max(512),
+            thread: z.string().min(1).max(512).optional()
+          })
+          .strict()
+          .describe('Where notifications are delivered'),
+        budgetPolicyRef: z.string().min(1).max(200).describe('Budget policy the daemon enforces per run'),
+        toolPolicyRef: z.string().min(1).max(200).describe('Tool policy the daemon enforces per run'),
+        notificationPolicy: z
+          .object({ mode: z.enum(['changes', 'all']), includeCompletion: z.boolean() })
+          .strict()
+          .describe('When to notify'),
+        visibilityPolicyRef: z.string().min(1).max(200).describe('Visibility policy for the objective'),
+        minIntervalSeconds: z
+          .number()
+          .int()
+          .min(60)
+          .max(86_400)
+          .optional()
+          .describe('Minimum seconds between firings (default 60)'),
+        maxRunsPerDay: z.number().int().min(1).max(1_440).optional().describe('Hard cap on runs per day (default 24)'),
+        maxNotificationsPerDay: z
+          .number()
+          .int()
+          .min(0)
+          .max(1_440)
+          .optional()
+          .describe('Hard cap on notifications per day (default 2)'),
+        conversationRef: z
+          .object({
+            platform: z.string().min(1).max(64),
+            integrationId: z.string().uuid(),
+            channel: z.string().min(1).max(512),
+            thread: z.string().min(1).max(512).optional()
+          })
+          .strict()
+          .nullable()
+          .optional()
+          .describe('Source conversation context (nullable)'),
+        sourceSessionId: z
+          .string()
+          .min(1)
+          .max(200)
+          .nullable()
+          .optional()
+          .describe('Session that originated this objective (nullable)')
+      })
+      .strict(),
+    call: (ctx, a) => {
+      const { agentId: _aid, ...defFields } = a
+      const definition: Record<string, unknown> = { ...defFields }
+      if (definition.conversationRef === undefined) definition.conversationRef = null
+      if (definition.sourceSessionId === undefined) definition.sourceSessionId = null
+      if (definition.minIntervalSeconds === undefined) definition.minIntervalSeconds = 60
+      if (definition.maxRunsPerDay === undefined) definition.maxRunsPerDay = 24
+      if (definition.maxNotificationsPerDay === undefined) definition.maxNotificationsPerDay = 2
+      return ctx.send('POST', org(ctx, '/standing-work'), { idempotencyKey: randomUUID(), definition })
+    }
+  },
+  {
+    name: 'pauseStandingWork',
+    description: 'Pause a Standing Work item.',
+    write: true,
+    schema: z
+      .object({
+        workId: z.string().uuid().describe('The Standing Work id'),
+        expectedVersion: z.number().int().positive().describe('Current definitionVersion')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.send('POST', org(ctx, `/standing-work/${seg(a.workId)}/pause`), { expectedVersion: a.expectedVersion })
+  },
+  {
+    name: 'resumeStandingWork',
+    description: 'Resume a paused Standing Work item.',
+    write: true,
+    schema: z
+      .object({
+        workId: z.string().uuid().describe('The Standing Work id'),
+        expectedVersion: z.number().int().positive().describe('Current definitionVersion')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.send('POST', org(ctx, `/standing-work/${seg(a.workId)}/resume`), { expectedVersion: a.expectedVersion })
+  },
+  {
+    name: 'cancelStandingWork',
+    description: 'Permanently cancel a Standing Work item - IRREVERSIBLE.',
+    write: true,
+    destructive: true,
+    schema: z
+      .object({
+        workId: z.string().uuid().describe('The Standing Work id'),
+        expectedVersion: z.number().int().positive().describe('Current definitionVersion'),
+        confirm: z.string().min(1).describe('The item exact name - a deliberate re-type')
+      })
+      .strict(),
+    call: async (ctx, a) => {
+      const target = await ctx.get(org(ctx, `/standing-work/${seg(a.workId)}`))
+      if (target.statusCode !== 200) return target
+      const item = JSON.parse(target.body) as { name?: unknown }
+      if (typeof item.name !== 'string' || item.name !== a.confirm)
+        return confirmMismatch('the Standing Work item name')
+      return ctx.send('POST', org(ctx, `/standing-work/${seg(a.workId)}/cancel`), {
+        expectedVersion: a.expectedVersion
+      })
+    }
+  },
+  {
+    name: 'approveStandingWork',
+    description: 'Approve a Standing Work definition - owner-only.',
+    write: true,
+    schema: z
+      .object({
+        workId: z.string().uuid().describe('The Standing Work id'),
+        expectedVersion: z.number().int().positive().describe('Current definitionVersion')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.send('POST', org(ctx, `/standing-work/${seg(a.workId)}/approve`), { expectedVersion: a.expectedVersion })
   }
 ]
 

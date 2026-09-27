@@ -139,12 +139,23 @@ export const SESSION_PURGE_FEATURE = 'session-purge-v1'
 export const SESSION_METADATA_ACK_FEATURE = 'session-metadata-ack-v1'
 
 /**
+ * CP accepts the batched `audit/flush` request and its `audit/flush/ok` reply
+ * (A1 unified audit). Advertised by the CP in `register/ok.serverFeatures`; a
+ * daemon that does not see it KEEPS its audit rows queued instead of emitting a
+ * frame an older CP would reject as `UNKNOWN_FRAME`.
+ */
+export const EXECUTION_AUDIT_V1_FEATURE = 'execution-audit-v1'
+
+/**
  * Daemon understands the `session/visibility` gate pushes + register-time
  * snapshot replay (session-visibility.md §5.1). Advertised by the daemon in
  * `RegisterReq.capabilities.features`; the CP gates all visibility pushes on
  * it so older daemons never see the frames.
  */
 export const SESSION_VISIBILITY_FEATURE = 'session-visibility-v1'
+
+/** Advertised only after the fixed Standing Work release gate is satisfied. */
+export const STANDING_WORK_FIXED_V1_FEATURE = 'standing-work-fixed-v1'
 
 /** Daemon/runtime support private, session-scoped remote MCP headers and stable invocation ids. */
 export const WEBCHAT_REMOTE_MCP_FEATURE = 'webchat_remote_mcp_v1'

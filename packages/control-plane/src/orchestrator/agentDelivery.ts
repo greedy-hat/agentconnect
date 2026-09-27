@@ -17,7 +17,7 @@
  * (frame-mode) member's connection carries no org and a duty holder is exactly
  * the connection that cannot resolve one from its own maps.
  */
-import type { CronUpsert, IntegrationSpec } from '@agentconnect.md/protocol'
+import type { CronUpsert, IntegrationSpec, StandingWorkControl } from '@agentconnect.md/protocol'
 import type { AgentSpecAssembler } from './agentSpecAssembler.js'
 import type { ControlSender } from './outbound.js'
 import { PLACEMENT_ONLY, type PlacementResolver, type ResolvableAgent } from './placementResolver.js'
@@ -36,7 +36,13 @@ export class AgentDelivery {
     private readonly deps: {
       control: Pick<
         ControlSender,
-        'agentUpsert' | 'agentRemove' | 'integrationUpsert' | 'integrationRemove' | 'cronUpsert' | 'cronRemove'
+        | 'agentUpsert'
+        | 'agentRemove'
+        | 'integrationUpsert'
+        | 'integrationRemove'
+        | 'cronUpsert'
+        | 'cronRemove'
+        | 'standingWorkControl'
       >
       specs: AgentSpecAssembler
       /** Absent (tests / no pool) ⇒ placement alone, which is the pre-duty behavior. */
@@ -180,6 +186,20 @@ export class AgentDelivery {
       targets,
       onError,
       async (daemonId) => void (await this.deps.control.cronRemove(daemonId, { cronId }, orgId))
+    )
+  }
+
+  /** Push a standing-work lifecycle decision to every daemon serving the agent. */
+  async standingWorkControl(
+    agent: ResolvableAgent,
+    wire: StandingWorkControl,
+    onError: DeliveryErrorHandler
+  ): Promise<void> {
+    const targets = await this.daemonsFor(agent)
+    await this.fanOut(
+      targets,
+      onError,
+      async (daemonId) => void (await this.deps.control.standingWorkControl(daemonId, wire))
     )
   }
 

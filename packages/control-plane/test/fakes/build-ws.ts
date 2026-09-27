@@ -41,6 +41,8 @@ import {
   PgHookSecretStore
 } from '../../src/persistence/index.js'
 import { PgMemberSetRepo } from '../../src/persistence/repositories/member-set.repo.js'
+import { PgStandingWorkRepo } from '../../src/persistence/repositories/standing-work.repo.js'
+import { PgAuditRepo } from '../../src/persistence/repositories/audit.repo.js'
 import { PgAgentRepoAuthorizationRepo } from '../../src/persistence/repositories/agent-repo-auth.repo.js'
 import { PlaintextSecretCipher } from '../../src/secrets/cipher.js'
 import { EpochService } from '../../src/orchestrator/epoch.js'
@@ -177,6 +179,8 @@ export function buildWsHarness(prisma: PrismaClient, opts: HarnessOpts = {}): Ws
     agentSecret: new PgAgentSecretStore(prisma, cipher),
     assignment: new PgAssignmentRepo(prisma),
     cron: new PgCronRepo(prisma),
+    standingWork: new PgStandingWorkRepo(prisma),
+    audit: new PgAuditRepo(prisma),
     hook: new PgHookRepo(prisma),
     lease: new PgSecretLeaseRepo(prisma),
     integration: new PgIntegrationRepo(prisma),
@@ -295,6 +299,7 @@ export function buildWsHarness(prisma: PrismaClient, opts: HarnessOpts = {}): Ws
         relayRoster: { entries: async () => relays }
       },
       duties: dutyGroupRepo,
+      standingWork: new PgStandingWorkRepo(prisma),
       placement: placementResolver
     }
   )
@@ -391,6 +396,8 @@ export function buildWsHarness(prisma: PrismaClient, opts: HarnessOpts = {}): Ws
     collabRoutes,
     dutyLease,
     cron: repos.cron,
+    standingWork: repos.standingWork,
+    audit: repos.audit,
     hook: repos.hook,
     externalMemoryConnection: repos.externalMemoryConnection,
     organizationKnowledge: repos.organizationKnowledge,

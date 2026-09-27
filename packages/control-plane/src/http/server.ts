@@ -57,7 +57,10 @@ import { meKeyRoutes } from './routes/me-keys.js'
 import { orgRoutes, orgScopedRoutes } from './routes/orgs.js'
 import { makeOrgScope } from './org-scope.js'
 import { cronRoutes } from './routes/crons.js'
+import { standingWorkRoutes } from './routes/standing-work.js'
 import { hookRoutes } from './routes/hooks.js'
+import { principalRoutes } from './routes/principals.js'
+import { auditRoutes } from './routes/audit.js'
 import { trustedActorRoutes } from './routes/trusted-actors.js'
 import { sessionRoutes } from './routes/sessions.js'
 import { usageRoutes } from './routes/usage.js'
@@ -338,7 +341,10 @@ export function buildHttpServer(deps: HttpDeps, opts: FastifyServerOptions = {})
           await scope.register(memberRoutes(deps))
           await scope.register(orgInviteLinkRoutes(deps))
           await scope.register(cronRoutes(deps))
+          await scope.register(standingWorkRoutes(deps))
           await scope.register(hookRoutes(deps))
+          await scope.register(principalRoutes(deps))
+          await scope.register(auditRoutes(deps))
           await scope.register(trustedActorRoutes(deps))
           await scope.register(sessionRoutes(deps))
           await scope.register(streamRoutes(deps))

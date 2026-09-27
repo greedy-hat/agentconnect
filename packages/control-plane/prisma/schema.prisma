@@ -94,6 +94,7 @@ model Org {
   agents                    Agent[]
   memberSets                MemberSet[]
   crons                     CronDef[]
+  standingWorks             StandingWorkDef[]
   hooks                     HookDef[]
   codeHostRepositories      CodeHostRepository[]
   codeHostTrustedActors     CodeHostTrustedActor[]
@@ -128,6 +129,7 @@ model Org {
   agentMemoryFiles          AgentMemoryFile[]
   agentMemoryMutations      AgentMemoryMutation[]
   agentMemoryHistory        AgentMemoryHistory[]
+  principals                Principal[]
 
   @@index([createdByUserId])
   @@map("org")
@@ -841,6 +843,7 @@ model Agent {
   sessionUsage          SessionUsage[]
   sessionSpend          SessionSpend[]
   crons                 CronDef[]
+  standingWorks         StandingWorkDef[]
   hooks                 HookDef[]
   integrations          Integration[]
   repoAuths             AgentRepoAuthorization[]
@@ -854,6 +857,7 @@ model Agent {
   memoryFiles           AgentMemoryFile[]
   memoryMutations       AgentMemoryMutation[]
   memoryHistory         AgentMemoryHistory[]
+  principals            Principal[]
 
   @@unique([orgId, name]) // slug is unique within an org
   // Referenced by the composite assignment FK: a binding cannot name an agent in
@@ -1727,6 +1731,129 @@ model CronDef {
   @@index([agentId])
   @@index([targetIntegrationId])
   @@map("cron_def")
+}
+
+// Control-plane authority for fixed Standing Work. Runtime state and reports stay in the daemon store.
+model StandingWorkDef {
+  id                       String   @id @db.Uuid
+  orgId                    String
+  agentId                  String   @db.Uuid
+  principalId              String
+  name                     String
+  objective                String   @db.Text
+  state                    String   @default("active")
+  definitionVersion        Int      @default(1)
+  schedule                 String
+  timezone                 String
+  startAt                  DateTime @db.Timestamptz(6)
+  expiresAt                DateTime @db.Timestamptz(6)
+  scheduleMode             String   @default("fixed")
+  minIntervalSeconds       Int
+  maxIntervalSeconds       Int      @default(86400)
+  wakeOnConversation       Boolean  @default(false)
+  maxRunsPerDay            Int
+  maxNotificationsPerDay   Int
+  conversationRef          Json?    @db.JsonB
+  targetDestination        Json     @db.JsonB
+  budgetPolicyRef          String
+  toolPolicyRef            String
+  notificationPolicy       Json     @db.JsonB
+  visibilityPolicyRef      String
+  sourceSessionId          String?
+  createdByActorId         String
+  lastModifiedByActorId    String
+  authorizationRevision    Int
+  approvalState            String   @default("pending")
+  approvalVersion          Int?
+  approvedByActorId        String?
+  createIdempotencyKey     String
+  createRequestHash        String
+  createdAt                DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt                DateTime @updatedAt @db.Timestamptz(6)
+
+  org                      Org      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  agent                    Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  runs                     StandingWorkRun[]
+
+  @@unique([orgId, createIdempotencyKey])
+  @@index([orgId, agentId, state])
+  @@map("standing_work_def")
+}
+
+// One ambient run of a standing objective, as the executing daemon shipped it over
+// `standing-work/report` (the same push→persist→poll shape as `cron/report`). The daemon's local
+// `standing_work_run` stays authoritative — the CP row is a latest-wins projection fenced on
+// (definitionVersion, executionEpoch), so a stale executor's report drops silently. It carries no
+// objective output: outcome + timing + the session to deep-link, nothing else.
+model StandingWorkRun {
+  id                String                 @id @default(cuid())
+  orgId             String
+  workId            String                 @db.Uuid
+  runId             String                 @db.Uuid
+  definitionVersion Int
+  executionEpoch    Int
+  attempt           Int                    @default(1)
+  outcome           StandingWorkRunOutcome
+  startedAt         DateTime               @db.Timestamptz(6)
+  finishedAt        DateTime?              @db.Timestamptz(6)
+  sessionId         String?
+  errorCode         String?
+  suggestedNextCheckAt DateTime?            @db.Timestamptz(6)
+  wakeSource        StandingWorkWakeSource @default(scheduled)
+  createdAt         DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime               @updatedAt @db.Timestamptz(6)
+
+  work          StandingWorkDef            @relation(fields: [workId], references: [id], onDelete: Cascade)
+  notifications StandingWorkNotification[]
+
+  @@unique([workId, runId])
+  @@index([orgId, workId, startedAt(sort: Desc)])
+  @@map("standing_work_run")
+}
+
+enum StandingWorkRunOutcome {
+  no_change
+  notify
+  blocked
+  complete
+  failed
+}
+
+enum StandingWorkWakeSource {
+  scheduled
+  conversation
+}
+
+// Delivery of one run's notification, as its own row so an `uncertain` send stays queryable and can
+// never be folded into the run's outcome — the daemon reports the two facts separately for exactly
+// this reason. No message body: status + provider receipt + error text only.
+model StandingWorkNotification {
+  id                String                       @id @default(cuid())
+  orgId             String
+  workId            String                       @db.Uuid
+  runId             String                       @db.Uuid
+  notificationIndex Int
+  effectId          String
+  status            StandingWorkNotificationStatus
+  providerReceipt   String?
+  error             String?
+  createdAt         DateTime                     @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime                     @updatedAt @db.Timestamptz(6)
+
+  run StandingWorkRun @relation(fields: [workId, runId], references: [workId, runId], onDelete: Cascade)
+
+  @@unique([runId, notificationIndex])
+  @@index([orgId, workId])
+  @@map("standing_work_notification")
+}
+
+enum StandingWorkNotificationStatus {
+  pending
+  sending
+  delivered
+  uncertain
+  failed
+  suppressed
 }
 
 // One fire of a schedule (`cron/report` EVT pairs keyed on (cronId, startedAt)):
@@ -2805,12 +2932,53 @@ enum AuditKind {
   api_key_rotate
   api_key_revoke
   mcp_tool_call
+  principal_create
+  principal_disable
+  principal_enable
+  principal_grant_create
+  principal_grant_revoke
+  // Daemon-execution trail (A1), arriving through `audit/flush` from a daemon's durable outbox.
+  // `admission` is one holder claiming an occurrence; `external_effect` is an intent and its result.
+  admission
+  admission_denied
+  tool_intent
+  tool_result
+  budget_reserved
+  budget_settled
+  external_effect
+}
+
+// A1 unified audit — where an event was produced. `cp` rows are written by
+// control-plane services; `daemon` rows arrive through the idempotent ingest
+// endpoint from a daemon's durable outbox. Retained so a reader can tell a
+// locally-recorded fact from one reconciled over the wire.
+enum AuditSource {
+  cp
+  daemon
 }
 
 model AuditEvent {
-  id          BigInt    @id @default(autoincrement()) @db.BigInt
-  orgId       String?
-  kind        AuditKind
+  id       BigInt       @id @default(autoincrement()) @db.BigInt
+  orgId    String?
+  kind     AuditKind
+  // A1 causal envelope. `eventId` is the stable ingestion key a daemon supplies
+  // so a retried outbox flush deduplicates rather than double-recording; it is
+  // nullable because control-plane-native events do not carry one. `traceId`
+  // ties an admission → tool → external-effect chain together; `parentEventId`
+  // names the causal predecessor (a plain pointer, never an FK — events may
+  // arrive out of order and audit rows are append-only); `effectId` is the
+  // external-effect identity; `principalId` is the execution principal (I1).
+  eventId        String?      @unique
+  traceId        String?
+  parentEventId  String?
+  effectId       String?
+  principalId    String?      @db.Uuid
+  source         AuditSource  @default(cp)
+  // `occurredAt` is when the event happened at its source; `createdAt` is when
+  // this row was ingested. Offline delivery can make them diverge, so both are
+  // retained. Nullable so existing rows need no backfill; new writes set it.
+  occurredAt DateTime? @db.Timestamptz(6)
+
   daemonId    String?   @db.Uuid
   agentId     String?   @db.Uuid
   sessionId   String?   @db.Uuid
@@ -2824,6 +2992,11 @@ model AuditEvent {
   @@index([orgId, createdAt])
   @@index([daemonId, createdAt])
   @@index([kind, createdAt])
+  @@index([orgId, kind, createdAt])
+  @@index([orgId, occurredAt])
+  @@index([traceId])
+  @@index([effectId])
+  @@index([principalId])
   @@map("audit_event")
 }
 
@@ -3874,4 +4047,119 @@ model AgentMemoryMutation {
   @@index([agentId, sourceTurnId])
   @@index([orgId])
   @@map("agent_memory_mutation")
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// §I1 Agent Identity v1 — org-owned execution principals (improvement-roadmap §5)
+// ───────────────────────────────────────────────────────────────────────────
+
+// What kind of execution identity a principal represents. `agent` is bound to
+// a specific agent row; `service` is a standalone non-human identity (e.g. a
+// CI pipeline or webhook handler); `delegated` is a human OAuth flow that the
+// organization has authorized to act on its behalf.
+enum PrincipalKind {
+  agent
+  service
+  delegated
+}
+
+// Lifecycle state of a principal. `active` admits runs and effects; `disabled`
+// blocks new runs and new effects and reconciles active work. Transition to
+// `disabled` bumps `authorizationRevision` so stale holders are fenced.
+enum PrincipalState {
+  active
+  disabled
+}
+
+// An organization-owned execution principal. Every admitted run carries a
+// `principalId` that resolves to one of these rows. Disabling a principal
+// blocks new runs and new effects; the `authorizationRevision` fence ensures
+// stale executors cannot commit after disable.
+model Principal {
+  id                    String        @id @db.Uuid
+  orgId                 String
+  name                  String
+  kind                  PrincipalKind
+  // Optional agent binding — when kind='agent', this FK ties the principal to
+  // a specific agent. Null for service/delegated kinds. Deliberately NOT
+  // required: a service principal has no agent row.
+  agentId               String?       @db.Uuid
+  state                 PrincipalState @default(active)
+  // Set when state transitions to `disabled`. The actor who disabled it
+  // (human userId or system actor like "system:expiry-reaper").
+  disabledAt            DateTime?     @db.Timestamptz(6)
+  disabledBy            String?
+  // Monotonic revision bumped on every lifecycle change (disable, enable,
+  // credential rotation). Execution provenance carries the revision it was
+  // granted under; stale revisions are refused at admission and effect time.
+  authorizationRevision Int           @default(1)
+  // Audit: who created this principal (human userId or system actor).
+  createdByActorId      String
+  createdAt             DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime      @updatedAt @db.Timestamptz(6)
+
+  org    Org              @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  agent  Agent?           @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  grants PrincipalGrant[]
+
+  @@unique([orgId, name])
+  @@index([orgId])
+  @@index([orgId, state])
+  @@map("principal")
+}
+
+// The kind of resource a grant controls access to.
+enum PrincipalGrantResourceType {
+  // A code repository (GitHub/GitLab/Gitea). `resourceId` is the numeric
+  // external repo/project id (rename-immune match key).
+  repo
+  // A conversation destination (Slack channel, Telegram chat, etc.).
+  // `resourceId` is a JSON-encoded conversation ref.
+  destination
+  // A tool or tool category. `resourceId` is the tool name or prefix.
+  tool
+}
+
+// Capability ceiling for a grant. Follows the same rank ordering as the code
+// host broker: read < comment < write. For non-repo resources, only the
+// relevant subset is meaningful (e.g. destination grants use execute/notify).
+enum PrincipalGrantCapability {
+  read
+  comment
+  write
+  execute
+  notify
+}
+
+// A revocable grant binding a principal to a specific resource with a
+// specific capability ceiling. Grants have optional expiry and can be
+// explicitly revoked. The grant model unifies the previously scattered
+// authorization records (AgentRepoAuthorization, etc.) under one roof.
+model PrincipalGrant {
+  id           String                     @id @default(cuid())
+  orgId        String
+  principalId  String                     @db.Uuid
+  resourceType PrincipalGrantResourceType
+  // Resource identifier — interpretation depends on `resourceType`:
+  // repo → numeric external id (BigInt as string for portability),
+  // destination → JSON conversation ref,
+  // tool → tool name or "category:*" prefix.
+  resourceId   String
+  capability   PrincipalGrantCapability
+  // Optional finite lifetime. Null means no expiry (org policy caps still apply).
+  expiresAt    DateTime?                  @db.Timestamptz(6)
+  // Explicit revocation. Once set, the grant is dead — rows are never deleted.
+  revokedAt    DateTime?                  @db.Timestamptz(6)
+  revokedBy    String?
+  // Audit: who created this grant.
+  createdByActorId String
+  createdAt    DateTime                   @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime                   @updatedAt @db.Timestamptz(6)
+
+  principal Principal @relation(fields: [principalId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, principalId, resourceType, resourceId, capability])
+  @@index([orgId, principalId])
+  @@index([principalId, resourceType])
+  @@map("principal_grant")
 }

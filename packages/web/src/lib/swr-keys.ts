@@ -104,6 +104,9 @@ export const consoleKeys = {
   sessionDetail: (orgId: string | null | undefined, sessionId: string | null | undefined) =>
     sessionId ? consoleKey(orgId, 'session-detail', sessionId) : null,
   cronRuns: (orgId: string | null | undefined, cronId: string) => consoleKey(orgId, 'cron-runs', cronId),
+  standingWork: (orgId: string | null | undefined) => consoleKey(orgId, 'standing-work'),
+  standingWorkRuns: (orgId: string | null | undefined, workId: string) =>
+    consoleKey(orgId, 'standing-work-runs', workId),
   agentHooks: (orgId: string | null | undefined, agentId: string | null | undefined) =>
     agentId ? consoleKey(orgId, 'agent-hooks', agentId) : null,
   // Per-repository list reached through one hook row (the settings dialog's).
@@ -119,7 +122,21 @@ export const consoleKeys = {
     agentId ? consoleKey(orgId, 'agent-permission-requests', agentId) : null,
   /** The org's sessions waiting on an approval — the bell's feed (slack-approval-dm.md §7). */
   pendingApprovals: (orgId: string | null | undefined) => consoleKey(orgId, 'session-approvals'),
-  hookRuns: (orgId: string | null | undefined, hookId: string) => consoleKey(orgId, 'hook-runs', hookId)
+  hookRuns: (orgId: string | null | undefined, hookId: string) => consoleKey(orgId, 'hook-runs', hookId),
+  /** I1 Agent Identity — org-owned execution principals. */
+  principals: (orgId: string | null | undefined) => consoleKey(orgId, 'principals'),
+  principalGrants: (orgId: string | null | undefined, principalId: string) =>
+    consoleKey(orgId, 'principal-grants', principalId),
+  /** A1 Unified Audit — org-isolated execution trail. The cursor and every filter are part of the
+   *  key so a paged window and a narrowed search never share cache entries. */
+  audit: (
+    orgId: string | null | undefined,
+    cursor: string,
+    limit: string,
+    kinds: string,
+    traceId: string,
+    agentId: string
+  ) => consoleKey(orgId, 'audit', cursor, limit, kinds, traceId, agentId)
 }
 
 export const profileKeys = {

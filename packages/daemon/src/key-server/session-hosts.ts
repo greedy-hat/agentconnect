@@ -20,7 +20,8 @@ import { DEFAULT_MODEL_KEY_TTL_SECONDS, KeyServerClient, parseModelKeyTtlSeconds
 export const internalSessionKey = {
   dream: (dreamId: string) => `internal:dream:${dreamId}`,
   memory: (agentId: string) => `internal:memory:${agentId}`,
-  commit: (agentId: string, nonce: string) => `internal:commit:${agentId}:${nonce}`
+  commit: (agentId: string, nonce: string) => `internal:commit:${agentId}:${nonce}`,
+  standingWork: (agentId: string, nonce: string) => `internal:standing-work:${agentId}:${nonce}`
 }
 
 /** What the pool still needs from the daemon: host construction, store reads, org lookup, log. */

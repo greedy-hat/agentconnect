@@ -5,6 +5,7 @@ import {
   MEMORY_ENTRIES_HISTORY_V1_FEATURE,
   MEMORY_ENTRIES_WRITE_V1_FEATURE,
   CONVERSATION_SESSION_MODE_V1_FEATURE,
+  STANDING_WORK_FIXED_V1_FEATURE,
   AgentActivate as AgentActivateSchema,
   AgentSkillEntry as AgentSkillEntrySchema,
   WEBCHAT_MULTI_AGENT_FEATURE,
@@ -406,6 +407,20 @@ import { startK8sRuntimePlane, type K8sRuntimePlane } from './k8s/runtime-plane.
 import { wireWorkspacePlane, type ExecutionPlane, type PlaneLaunch } from './execution/plane.js'
 import { seedSessionHome, startExecutorFacet, type ExecutorFacet } from './execution/executor-facet.js'
 import { effectiveStrategies } from './execution/strategies.js'
+import { DaemonAuditRecorder } from './execution/audit-recorder.js'
+import { ExecutionAuditFlusher } from './execution/audit-flush.js'
+import {
+  StandingWorkAmbientExecutor,
+  StandingWorkControlPlane,
+  StandingWorkGatewayDestinationResolver,
+  StandingWorkMessageDispatcher,
+  StandingWorkPump,
+  StandingWorkService,
+  StandingWorkWakeCoordinator,
+  standingWorkReportCatchup,
+  type AmbientTurnRunner,
+  type StandingWorkContextReader
+} from './execution/standing-work.js'
 import {
   declaredRuntimeCatalog,
   loadK8sRuntimeTable,
@@ -613,7 +628,9 @@ import type {
   McpAppRpc,
   McpAppRpcResult,
   CodeHostProvider,
-  McpAppOutcome
+  McpAppOutcome,
+  StandingWorkProjection,
+  StandingWorkRunReport
 } from '@agentconnect.md/protocol'
 import { boundedDiagnostic, formatErr, startFailureDetail } from './daemon/text.js'
 import { isBuiltinSystemToolCall, type ApprovalRequestParts } from './daemon/tool-classification.js'
@@ -892,6 +909,9 @@ export class Daemon {
   private commitMessageDirs = new Map<string, string>()
   /** The quarantine key of an agent's LAST commit-message pass, so presses don't accumulate one. */
   private commitMessageTombstones = new Map<string, string>()
+  /** Throwaway empty cwd per agent for an ambient standing-work turn (a silent, read-only pass). */
+  /** The quarantine key of an agent's LAST ambient standing-work turn, so runs don't accumulate one. */
+  private standingWorkTombstones = new Set<string>()
   /** Host instances that failed the trusted/read-only preflight; retry only after host replacement. */
   private memoryExtractionUnavailable = new WeakSet<AcpHost>()
   /** Lazily-built dream-job engine (docs/designs/memory-dreaming.md §4). */
@@ -1162,6 +1182,14 @@ export class Daemon {
   // Grant admission, install, and the platform convergence a duty change needs — the timing-critical
   // half of the lease path, with its own in-flight state (cp/duty-coordinator.ts).
   private readonly dutyCoordinator = new DutyCoordinator(this.dutyHost())
+  // Fixed Standing Work. The control adapter is always live once the store is open: the daemon
+  // applies the CP's fenced lifecycle decisions (approve/pause/resume/cancel) over its durable
+  // rows. The executing pump is constructed ONLY when the shared-store + isolated read-only
+  // session prerequisites are met; while it is absent the feature is not advertised and the CP
+  // projects no definitions, so the daemon fails closed rather than half-running autonomous work.
+  private standingWorkControl?: StandingWorkControlPlane
+  private standingWorkPump?: StandingWorkPump
+  private standingWorkWakeCoordinator?: StandingWorkWakeCoordinator
   // ACP permission + elicitation policy and its pending human-approval state (permissions/coordinator.ts).
   private readonly permissions = new PermissionCoordinator(this.permissionHost())
 
@@ -1433,6 +1461,9 @@ export class Daemon {
   // The durable session-metadata outbox (store/session-metadata-outbox.ts); owns its
   // own drain promise and retry timer behind the delegates below.
   private readonly sessionMetadataOutbox: SessionMetadataOutbox
+  // The A1 execution-audit outbox drain (execution/audit-flush.ts). Gated OFF: inert until the operator
+  // opts in, and silent while the connected control plane does not advertise the feature.
+  private readonly executionAuditFlusher: ExecutionAuditFlusher
   // Observed-channel discovery/retraction (platforms/observed-channels-sync.ts).
   private readonly observedChannelsSync: ObservedChannelsSync
   private readonly webchatTransport: WebchatTransport
@@ -1473,6 +1504,17 @@ export class Daemon {
       /** Explicit test/evaluation-only Dream bypass. It is honored only with an
        * injected hostFactory, never by the production CLI/config surface. */
       dreamOperationPolicy?: DreamOperationPolicy
+      /** Operator opt-in to run the fixed Standing Work executing pump. Default OFF: while absent the
+       * daemon applies CP lifecycle decisions but never sweeps due occurrences, never runs ambient
+       * turns, and does not advertise `standing-work-fixed-v1` — so the feature stays dark until the
+       * definition-ingestion boundary (W1) and the operator timeline (W5) are in place. A test may set
+       * it with an injected hostFactory to exercise the ambient runner. */
+      standingWorkExecution?: boolean
+      /** Operator opt-in to write execution-audit events into the durable local outbox. Default OFF: while
+       *  absent the autonomous paths record nothing at all. It only ever produces rows where work is also
+       *  being executed, i.e. together with {@link standingWorkExecution} — a daemon that never sweeps has
+       *  nothing to audit. */
+      executionAudit?: boolean
       /** Time seam for the idle sweep + cancel backstop (FakeClock in tests). */
       clock?: Clock
       /** How the daemon exits for daemon/restart + daemon/upgrade (spied in tests). */
@@ -1561,6 +1603,16 @@ export class Daemon {
     this.claudeModelAliases = this.k8s ? configuredClaudeModelAliases(process.env) : undefined
     this.evalHooks = new DaemonEvaluationHooks(this.evaluationHost(), opts.evaluation)
     this.sessionMetadataOutbox = new SessionMetadataOutbox(this.sessionMetadataHost())
+    this.executionAuditFlusher = new ExecutionAuditFlusher({
+      source: () => this.store,
+      channel: () => this.cpClient,
+      clock: () => this.clock,
+      enabled: () => this.executionAuditAllowed(),
+      draining: () => this.draining,
+      servingAgentIds: () => [...this.agents.keys()].filter((agentId) => this.servesAgent(agentId)),
+      warn: (message) => this.log.warn(message),
+      debug: (message) => this.log.debug(message)
+    })
     this.observedChannelsSync = new ObservedChannelsSync(this.observedChannelsSyncHost())
     this.connections = new ConnectionReconciler(this.connectionReconcilerHost())
     this.webchatTransport = new WebchatTransport(this.webchatHost())
@@ -2639,6 +2691,9 @@ export class Daemon {
   /** Phase 16 — the local (or data-plane) store plus the one rule table every row retention runs from. */
   private async openStoreAndRetention(root: string): Promise<void> {
     this.store = this.dataPlane?.store ?? (await LocalStore.open(statePath(root)))
+    // The lifecycle adapter needs only the durable store, so it is always available here. The
+    // executing pump is deliberately not started at this phase — see the field's comment.
+    this.standingWorkControl = new StandingWorkControlPlane(new StandingWorkService(this.store))
     for (const agent of this.fileAgents.values()) {
       for (const integration of agent.integrations) {
         await this.store.setIntegrationRemoved(agent.id, integration.id, false)
@@ -3559,6 +3614,8 @@ export class Daemon {
     if (!this.k8s) startControlPlane(root)
     this.armIdleSweep()
     this.armStoreRetentionSweep()
+    // Fixed Standing Work execution — dark unless the operator opted in (see armStandingWorkPump).
+    this.armStandingWorkPump()
     this.startupComplete = true
     this.readiness?.refresh()
     this.log.info('daemon ready')
@@ -5455,6 +5512,10 @@ export class Daemon {
       // Append-mode coordinate admission, durable replay, reset CAS, and physical
       // thread affinity are all daemon-owned and present in this release.
       CONVERSATION_SESSION_MODE_V1_FEATURE,
+      // Advertised ONLY while this member actually runs the durable fixed-schedule pump (shared
+      // store + isolated read-only execution + policy backend live). Unadvertised ⇒ the CP ships
+      // no Standing Work definitions and refuses lifecycle frames: mixed/unknown peers fail closed.
+      ...(this.standingWorkPump ? [STANDING_WORK_FIXED_V1_FEATURE] : []),
       // This daemon persists the greatest applied AgentSpec.configRevision and
       // refuses an older or contradicting snapshot (organization-secrets-and-
       // variables.md §7). The CP gates placement of an agent bound to an
@@ -6065,6 +6126,254 @@ export class Daemon {
     if (prior && prior !== key) this.memoryExtractionQuarantines.delete(prior)
     this.commitMessageTombstones.set(agentId, key)
     this.memoryExtractionQuarantines.set(key, agentId)
+  }
+
+  /** Keep a detached callback quarantined until its dedicated host is stopped. */
+  private retainStandingWorkTombstone(agentId: string, key: string): void {
+    this.standingWorkTombstones.add(key)
+    this.memoryExtractionQuarantines.set(key, agentId)
+  }
+
+  /**
+   * One silent, read-only ambient turn for a fixed Standing Work occurrence (design:
+   * standing-work W3). Shape is inherited from the two extraction passes it mirrors:
+   * - **Silent**: a collector with no `sessionKey` and no `transcript`, so the whole turn produces zero
+   *   store rows, zero platform delivery and zero evaluation telemetry. The sole external effect of a
+   *   standing check is the notification outbox, never this turn's own output.
+   * - **No MCP tools** (`newSession(cwd, [], …)`) plus `CLAUDE_HEADLESS_DISALLOWED_TOOLS`; the runtime's
+   *   built-in tools can't be removed over ACP, so the verified non-mutating mode below is the hard
+   *   gate that neuters them — the same fail-closed rule the dream and commit pass enforce.
+   * - **Dedicated host**: a fresh sandboxed host excludes agent tool credentials and is torn down
+   *   after the turn. A missing sandbox prevents admission.
+   *
+   * Every failure throws; the pump treats a thrown turn as a fenced, non-committed attempt whose lease
+   * simply expires. The pump — and so this path — is dark unless {@link standingWorkExecutionAllowed}.
+   */
+  private async runStandingWorkAmbientTurn(
+    agentId: string,
+    systemPrompt: string,
+    prompt: string,
+    signal: AbortSignal
+  ): Promise<{ output: string }> {
+    const agent = this.agents.get(agentId)
+    if (!agent) throw new Error(`unknown agent ${agentId}`)
+    if (signal.aborted) throw new Error('ambient standing-work turn canceled before dispatch')
+    if (!this.agentRunsInSandbox(agent)) throw new Error('standing work requires an available sandbox')
+    const cwd = await mkdtemp(join(tmpdir(), 'agentconnect-standing-work-'))
+    const owner = this.dreamOwnerKey(agentId, randomUUID())
+    let issued: { target: ModelProviderTarget; grant: KeyGrant } | undefined
+    let host: AcpHost | undefined
+    let pendingKey: string | undefined
+    try {
+      if (this.modelSessions.enabled) {
+        const runtime = this.runtimes[agent.runtime]
+        const target = runtime ? modelProviderTarget(agent, runtime) : undefined
+        if (!target) throw new Error(`runtime "${agent.runtime}" does not support MODEL_TOKEN translation`)
+        issued = {
+          target,
+          grant: await this.modelSessions.issueKey(
+            agent,
+            target,
+            internalSessionKey.standingWork(agentId, randomUUID())
+          )
+        }
+      }
+      host = await this.buildDreamHost(agent, cwd, owner, issued)
+      const activeHost = host
+      const trusted = host.usesMetaSystemPrompt()
+      // HARD GATE, fail closed: no verified non-mutating mode ⇒ no ambient run with write access.
+      const readOnlyMode = readOnlyExtractionMode(host.permissionModeOptions()?.modes ?? [])
+      if (!readOnlyMode) throw new Error('runtime lacks a verified read-only/plan mode')
+      const sessionId = trusted
+        ? await host.newSession(cwd, [], undefined, systemPrompt, [], undefined, CLAUDE_HEADLESS_DISALLOWED_TOOLS)
+        : await host.newSession(cwd, [], undefined, undefined, [], undefined, CLAUDE_HEADLESS_DISALLOWED_TOOLS)
+      const key = pendingTurnKey(owner, sessionId)
+      pendingKey = key
+      this.internalPassSessions.add(internalPassSlot.standingWork(agentId, sessionId), key)
+      try {
+        if (!(await host.setSessionPermissionMode(sessionId, readOnlyMode))) {
+          throw new Error('runtime rejected the read-only/plan mode')
+        }
+        if (signal.aborted) throw new Error('ambient standing-work turn canceled before dispatch')
+        const onAbort = () => void activeHost.cancel(sessionId).catch(() => {})
+        if (signal.aborted) onAbort()
+        else signal.addEventListener('abort', onAbort, { once: true })
+        const chunks: string[] = []
+        this.memoryExtractionQuarantines.delete(key)
+        this.memoryExtractionCollectors.set(key, { chunks, builtinSystemToolCallIds: new Set() })
+        try {
+          const text = trusted ? prompt : `${systemPrompt}\n\n${prompt}`
+          await this.promptWithCancelBackstop(
+            host,
+            sessionId,
+            text,
+            signal,
+            (detached) => {
+              this.memoryExtractionCollectors.delete(key)
+              this.retainStandingWorkTombstone(agentId, key)
+              void detached.catch(() => {})
+            },
+            'ambient standing-work turn'
+          )
+          return { output: chunks.join('') }
+        } finally {
+          signal.removeEventListener('abort', onAbort)
+          this.retainStandingWorkTombstone(agentId, key)
+          this.memoryExtractionCollectors.delete(key)
+        }
+      } finally {
+        host.discardSession(sessionId)
+        this.internalPassSessions.delete(key)
+      }
+    } finally {
+      await host?.stop().catch(() => {})
+      await this.microsandbox
+        ?.discard(`${agent.id}/${hostKeyDirName(owner)}`)
+        .then(() => rm(join(agent.dir, 'runtime-homes', hostKeyDirName(owner)), { recursive: true, force: true }))
+        .catch((error: unknown) =>
+          this.log.warn(`microsandbox: could not discard standing-work VM (${formatErr(error)})`)
+        )
+      removeHostSandboxState(agent.dir, owner)
+      if (issued) await this.modelSessions.revokeKeyQuietly(issued.grant.keyId)
+      await rm(cwd, { recursive: true, force: true })
+      if (pendingKey) {
+        this.memoryExtractionQuarantines.delete(pendingKey)
+        this.standingWorkTombstones.delete(pendingKey)
+      }
+    }
+  }
+
+  /** The daemon's AmbientTurnRunner: the durable executor depends only on this narrow seam, so the
+   *  security-critical session machinery stays in one reviewed method while the pump stays testable. */
+  private standingWorkAmbientRunner(): AmbientTurnRunner {
+    return {
+      run: ({ agentId, systemPrompt, prompt, signal }) =>
+        this.runStandingWorkAmbientTurn(agentId, systemPrompt, prompt, signal)
+    }
+  }
+
+  /** Read only the bounded text this Agent actually received or produced on the authorized source. */
+  private standingWorkContextReader(): StandingWorkContextReader {
+    return {
+      read: async ({ work, afterCursor, limit }) => {
+        let ref: { platform: string; integrationId: string; channel: string; thread?: string }
+        try {
+          const parsed = JSON.parse(work.conversationRefJson ?? 'null') as unknown
+          if (!parsed || typeof parsed !== 'object') throw new Error('missing context reference')
+          ref = parsed as typeof ref
+        } catch {
+          throw new Error('invalid context reference')
+        }
+        const integration = this.agents
+          .get(work.agentId)
+          ?.integrations.find((candidate) => candidate.id === ref.integrationId)
+        if (!integration || integration.platform !== ref.platform || !ref.channel)
+          throw new Error('context source is no longer available')
+        const transportScope = this.transportScopeForIntegrationIds([ref.integrationId])
+        if (!transportScope) throw new Error('context source has no transport scope')
+        const cursor = afterCursor === undefined ? 0 : Number(afterCursor)
+        if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error('invalid context cursor')
+        return await this.store.standingWorkContextPage(
+          work.orgId,
+          work.agentId,
+          transcriptChannelKey(ref.channel, transportScope),
+          ref.thread,
+          cursor,
+          limit
+        )
+      }
+    }
+  }
+
+  /** Whether this process may construct and run the executing pump. OFF by default: while false the pump
+   *  is never built, so `standing-work-fixed-v1` is not advertised and no ambient turn ever runs — the
+   *  daemon still applies CP lifecycle decisions over its durable rows. */
+  private standingWorkExecutionAllowed(): boolean {
+    return this.opts.standingWorkExecution === true
+  }
+
+  /** Whether this process may write execution-audit rows. OFF by default: with it absent every recorder
+   *  call site is a no-op, so a default daemon keeps an empty outbox. Flushing those rows to the control
+   *  plane is a separate concern (A1 Phase 5), never a reason to start recording early. */
+  private executionAuditAllowed(): boolean {
+    return this.opts.executionAudit === true
+  }
+
+  /** Reconcile CP-authoritative standing-work projections from a register/ok snapshot into the durable
+   *  execution core. Independent of the execution opt-in: a daemon that advertises the capability but does
+   *  not sweep still mirrors its objectives so its rows never drift from the control plane. In default
+   *  mode the feature is never advertised, so the CP sends no projections and this stays inert. */
+  private async ingestStandingWorks(projections: StandingWorkProjection[]): Promise<void> {
+    if (projections.length === 0) return
+    const service = new StandingWorkService(this.store, () => this.clock.now())
+    for (const projection of projections) await service.ingestFromProjection(projection)
+  }
+
+  /** The `standing-work/report` catch-up a READY connection re-asserts, so runs that finished while the CP
+   *  was unreachable still land. Empty unless the executing pump is armed — a default daemon emits no run telemetry. */
+  private async standingWorkReports(): Promise<StandingWorkRunReport[]> {
+    if (!this.standingWorkPump) return []
+    return standingWorkReportCatchup(await this.store.standingWorkReportFeed())
+  }
+
+  /** Build + start the executing pump, but only under the operator opt-in. Until then `standingWorkPump`
+   *  stays undefined, so the feature is neither advertised nor swept — the daemon fails closed on running
+   *  autonomous work it was never told to own. Idempotent: a repeat call while running does nothing. */
+  private armStandingWorkPump(): void {
+    if (!this.standingWorkExecutionAllowed() || this.standingWorkPump) return
+    const service = new StandingWorkService(this.store, () => this.clock.now())
+    const executor = new StandingWorkAmbientExecutor(this.standingWorkAmbientRunner(), this.standingWorkContextReader())
+    const dispatcher = new StandingWorkMessageDispatcher(
+      new StandingWorkGatewayDestinationResolver({
+        connForIntegration: (integrationId) => {
+          const conn = this.connForIntegration(integrationId)
+          return conn ? { postMessage: (channel, text, thread) => conn.postMessage(channel, text, thread) } : undefined
+        }
+      }),
+      () => this.clock.now()
+    )
+    this.standingWorkPump = new StandingWorkPump(
+      this.store,
+      service,
+      this.store.cacheOwner,
+      executor,
+      dispatcher,
+      () => this.clock.now(),
+      (agentId) => this.servesAgent(agentId),
+      { emit: (report) => this.cpClient?.emitStandingWorkReport(report) },
+      () => this.cpClient?.state === 'READY',
+      async (work, notification) => {
+        if (this.cpClient?.state !== 'READY') return 'retry'
+        const agent = this.agents.get(work.agentId)
+        if (!agent || !this.servesAgent(work.agentId)) return 'suppress'
+        let destination: { integrationId?: unknown; platform?: unknown; channel?: unknown }
+        try {
+          destination = JSON.parse(notification.destination) as typeof destination
+        } catch {
+          return 'suppress'
+        }
+        if (
+          typeof destination.integrationId !== 'string' ||
+          typeof destination.platform !== 'string' ||
+          typeof destination.channel !== 'string' ||
+          !destination.channel
+        )
+          return 'suppress'
+        return agent.integrations.some(
+          (integration) => integration.id === destination.integrationId && integration.platform === destination.platform
+        )
+          ? 'allow'
+          : 'suppress'
+      },
+      () => [...this.agents.keys()].filter((agentId) => this.servesAgent(agentId)),
+      new DaemonAuditRecorder(
+        this.store,
+        () => this.executionAuditAllowed(),
+        () => this.clock.now()
+      )
+    )
+    this.standingWorkPump.start()
+    this.standingWorkWakeCoordinator = new StandingWorkWakeCoordinator(this.store, () => this.clock.now())
   }
 
   /**
@@ -7253,6 +7562,15 @@ export class Daemon {
     msg.transportScope ??= this.transportScopeForIntegrationIds(srcIntegrationIds)
     if (msg.sender.avatarUrl && msg.transportScope)
       await this.store.setProfileAvatar(msg.transportScope, msg.sender.id, msg.sender.avatarUrl, Date.now())
+    if (this.standingWorkWakeCoordinator && srcIntegrationIds?.length) {
+      for (const integrationId of srcIntegrationIds) {
+        void this.standingWorkWakeCoordinator.onConversationEvent({
+          platform: msg.platform,
+          integrationId,
+          channel: msg.channel
+        })
+      }
+    }
     // A mention in a watched Slack channel can arrive via both `message.*` and
     // `app_mention`; both share channel:ts, so dedup the double-fire from ONE bot
     // connection. Do not dedup across bot connections: several Slack apps receive
@@ -19278,6 +19596,7 @@ export class Daemon {
       cpCollab: () => this.cpCollab,
       cpMcpDefs: () => this.cpMcpDefs,
       memoryConnections: () => this.memoryConnections,
+      ingestStandingWorks: (projections) => this.ingestStandingWorks(projections),
       convergeRelays: (relays) => this.convergeRelays(relays),
       onMcpDefsChanged: () => this.onMcpDefsChanged(),
       exactCpDependents: (agentId, desired) => this.exactCpDependents(agentId, desired),
@@ -19397,11 +19716,13 @@ export class Daemon {
       memoryConnections: () => this.memoryConnections,
       replayHookTerminalReports: () => this.replayHookTerminalReports(),
       replayChannelSnapshots: () => this.replayChannelSnapshots(),
+      armExecutionAuditFlush: () => this.executionAuditFlusher.arm(),
       replayApprovalActivity: () => this.permissions.replayApprovalActivity(),
       sessionMetadataOutbox: () => this.sessionMetadataOutbox,
       webchatMcpRevocations: () => this.webchatMcpRevocations,
       drainSessionPurges: () => this.drainSessionPurges(),
       effectiveAgents: () => this.effectiveAgents(),
+      standingWorkReports: () => this.standingWorkReports(),
       noteProjector: () => this.noteProjector,
       codeHostReviews: () => this.reviewOutbox,
       cpAgents: () => this.cpAgents,
@@ -19443,7 +19764,8 @@ export class Daemon {
       withWorkspaceIndexWrite: <T>(agentId: string, write: () => Promise<T>): Promise<T> =>
         this.withWorkspaceIndexWrite(agentId, write),
       runCommitMessagePass: (agentId, systemPrompt, prompt, signal) =>
-        this.runCommitMessagePass(agentId, systemPrompt, prompt, signal)
+        this.runCommitMessagePass(agentId, systemPrompt, prompt, signal),
+      standingWorkControl: () => this.standingWorkControl
     }
   }
 
@@ -20376,6 +20698,9 @@ export class Daemon {
       this.hookReportRetryTimer = undefined
     }
     this.sessionMetadataOutbox.dispose()
+    // An unacknowledged audit row is still durable, so shutdown drops the timer and leaves the
+    // backlog for the next process rather than waiting on the control plane.
+    this.executionAuditFlusher.dispose()
     // Clear any live orchestration deadline timers so they don't hold the process open
     // (the durable `orchestration.deadline` epoch re-arms them on the next startup).
     for (const t of this.collab.orchestrationDeadlines.values()) this.clock.clearTimeout(t)
@@ -20404,6 +20729,9 @@ export class Daemon {
     const errors: unknown[] = []
     this.scheduler?.stop()
     this.dreamScheduler?.stop()
+    // Stop sweeping before transport/store teardown so no ambient turn dispatches into a closing runtime.
+    this.standingWorkPump?.stop()
+    this.standingWorkWakeCoordinator?.stop()
     // CP editor writes, accepted Dream publication, and on-demand Git pulls all
     // hold this identity-tracked lease. The daemon-wide gate above rejects new
     // admissions; drain every already-admitted mutation before transport/store
